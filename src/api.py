@@ -1,4 +1,5 @@
 import os
+import sys
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from google.auth import default, load_credentials_from_file
@@ -6,11 +7,22 @@ from google.cloud import bigquery, storage
 import gspread
 from werkzeug.utils import secure_filename
 import io
+import logging
 import venezuela
 
 app = Flask(__name__)
 # Configurar CORS para permitir todos los orígenes
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Configurar logging para ver las peticiones en tiempo real
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+app.logger.setLevel(logging.INFO)
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.setLevel(logging.INFO)
 
 
 def get_credentials():
@@ -28,14 +40,17 @@ def get_credentials():
     if os.path.exists(credentials_path):
         try:
             print(f"Loading credentials from {credentials_path}")
+            sys.stdout.flush()
             credentials, project = load_credentials_from_file(credentials_path)
             return credentials, project
         except Exception as e:
             print(f"Warning: Could not load credentials from {credentials_path}: {str(e)}")
             print("Falling back to Application Default Credentials (ADC)")
+            sys.stdout.flush()
     
     # Fallback a ADC
     print("Using Application Default Credentials (ADC)")
+    sys.stdout.flush()
     credentials, project = default()
     return credentials, project
 
@@ -88,6 +103,13 @@ def health():
     Returns:
         JSON con el estado del servicio
     """
+    print("=" * 50)
+    print("[HEALTH] Endpoint called")
+    print(f"[HEALTH] Method: {request.method}")
+    print(f"[HEALTH] Service is running")
+    print("=" * 50)
+    sys.stdout.flush()
+    
     return jsonify({
         'status': 'healthy',
         'service': 'vzla-r011-direct-cleaning',
@@ -103,15 +125,31 @@ def test_bigquery_endpoint():
     Returns:
         JSON con el resultado de la prueba de conexión
     """
+    print("=" * 50)
+    print("[TEST BIGQUERY] Endpoint called")
+    print(f"[TEST BIGQUERY] Method: {request.method}")
+    sys.stdout.flush()
+    
     try:
+        print("[TEST BIGQUERY] Getting credentials...")
+        sys.stdout.flush()
         credentials, project_id = get_credentials()
+        
+        print(f"[TEST BIGQUERY] Testing connection to project: {project_id}")
+        sys.stdout.flush()
         success, message = test_bigquery_connection(credentials, project_id)
+        
+        print(f"[TEST BIGQUERY] Result: {success} - {message}")
+        sys.stdout.flush()
+        
         status_code = 200 if success else 500
         return jsonify({
             'success': success,
             'message': message
         }), status_code
     except Exception as e:
+        print(f"[TEST BIGQUERY] Error: {str(e)}")
+        sys.stdout.flush()
         return jsonify({
             'success': False,
             'message': f'Error testing BigQuery connection: {str(e)}'
@@ -126,15 +164,31 @@ def test_storage_endpoint():
     Returns:
         JSON con el resultado de la prueba de conexión
     """
+    print("=" * 50)
+    print("[TEST STORAGE] Endpoint called")
+    print(f"[TEST STORAGE] Method: {request.method}")
+    sys.stdout.flush()
+    
     try:
+        print("[TEST STORAGE] Getting credentials...")
+        sys.stdout.flush()
         credentials, project_id = get_credentials()
+        
+        print(f"[TEST STORAGE] Testing connection to project: {project_id}")
+        sys.stdout.flush()
         success, message = test_storage_connection(credentials, project_id)
+        
+        print(f"[TEST STORAGE] Result: {success} - {message}")
+        sys.stdout.flush()
+        
         status_code = 200 if success else 500
         return jsonify({
             'success': success,
             'message': message
         }), status_code
     except Exception as e:
+        print(f"[TEST STORAGE] Error: {str(e)}")
+        sys.stdout.flush()
         return jsonify({
             'success': False,
             'message': f'Error testing Cloud Storage connection: {str(e)}'
@@ -145,7 +199,7 @@ def test_storage_endpoint():
 def process_file():
     """
     Endpoint para procesar un archivo Excel.
-    Recibe un archivo Excel, lo procesa y devuelve el resultado.
+    Recibe un archivo Excel como form-data con el campo "file", lo procesa y devuelve el resultado.
     
     Query parameters opcionales:
         - upload_bigquery: Si está presente, sube el resultado a BigQuery
@@ -161,17 +215,29 @@ def process_file():
     Returns:
         Archivo Excel procesado o JSON con información del procesamiento
     """
+    print("=" * 50)
+    print("[PROCESS] Endpoint called")
+    print(f"[PROCESS] Method: {request.method}")
+    print(f"[PROCESS] Content-Type: {request.content_type}")
+    sys.stdout.flush()
+    
     try:
         # Verificar que se haya enviado un archivo
         if 'file' not in request.files:
+            print("[PROCESS] Error: No file provided in form-data")
+            sys.stdout.flush()
             return jsonify({
                 'error': 'No file provided',
-                'message': 'Please provide an Excel file in the "file" field'
+                'message': 'Please provide an Excel file in the "file" field as form-data'
             }), 400
         
         file = request.files['file']
+        print(f"[PROCESS] File received: {file.filename}")
+        sys.stdout.flush()
         
         if file.filename == '':
+            print("[PROCESS] Error: Empty filename")
+            sys.stdout.flush()
             return jsonify({
                 'error': 'No file selected',
                 'message': 'Please select a file to upload'
@@ -179,25 +245,38 @@ def process_file():
         
         # Verificar que sea un archivo Excel
         if not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):
+            print(f"[PROCESS] Error: Invalid file type - {file.filename}")
+            sys.stdout.flush()
             return jsonify({
                 'error': 'Invalid file type',
                 'message': 'Please upload an Excel file (.xlsx or .xls)'
             }), 400
         
         # Leer el contenido del archivo
+        print(f"[PROCESS] Reading file content...")
+        sys.stdout.flush()
         file_content = file.read()
         filename = secure_filename(file.filename)
+        print(f"[PROCESS] File size: {len(file_content)} bytes")
+        sys.stdout.flush()
+        
+        # Obtener credenciales para el procesamiento y los uploads
+        credentials, project_id = get_credentials()
         
         # Procesar el archivo
-        processed_content = venezuela.process_excel_file(file_content, filename)
-        
-        # Obtener credenciales para los uploads
-        credentials, project_id = get_credentials()
+        print(f"[PROCESS] Processing file: {filename}")
+        sys.stdout.flush()
+        processed_content = venezuela.process_excel_file(file_content, filename, credentials)
+        print(f"[PROCESS] File processed successfully. Output size: {len(processed_content)} bytes")
+        sys.stdout.flush()
         
         # Obtener parámetros opcionales
         upload_bigquery = request.args.get('upload_bigquery', 'false').lower() == 'true'
         upload_storage = request.args.get('upload_storage', 'false').lower() == 'true'
         upload_sheets = request.args.get('upload_sheets', 'false').lower() == 'true'
+        
+        print(f"[PROCESS] Upload options - BigQuery: {upload_bigquery}, Storage: {upload_storage}, Sheets: {upload_sheets}")
+        sys.stdout.flush()
         
         response_data = {
             'success': True,
@@ -208,6 +287,8 @@ def process_file():
         
         # Subir a BigQuery si se solicita
         if upload_bigquery:
+            print("[PROCESS] Uploading to BigQuery...")
+            sys.stdout.flush()
             dataset_id = request.args.get('dataset_id')
             table_id = request.args.get('table_id')
             if dataset_id and table_id:
@@ -221,7 +302,11 @@ def process_file():
                     'dataset': dataset_id,
                     'table': table_id
                 }
+                print(f"[PROCESS] BigQuery upload result: {success}")
+                sys.stdout.flush()
             else:
+                print("[PROCESS] BigQuery upload failed: missing dataset_id or table_id")
+                sys.stdout.flush()
                 response_data['uploads']['bigquery'] = {
                     'success': False,
                     'message': 'dataset_id and table_id are required'
@@ -229,6 +314,8 @@ def process_file():
         
         # Subir a Cloud Storage si se solicita
         if upload_storage:
+            print("[PROCESS] Uploading to Cloud Storage...")
+            sys.stdout.flush()
             bucket_name = request.args.get('bucket_name')
             blob_name = request.args.get('blob_name', filename)
             if bucket_name:
@@ -240,7 +327,11 @@ def process_file():
                     'bucket': bucket_name,
                     'blob': blob_name
                 }
+                print(f"[PROCESS] Cloud Storage upload result: {success}")
+                sys.stdout.flush()
             else:
+                print("[PROCESS] Cloud Storage upload failed: missing bucket_name")
+                sys.stdout.flush()
                 response_data['uploads']['storage'] = {
                     'success': False,
                     'message': 'bucket_name is required'
@@ -248,6 +339,8 @@ def process_file():
         
         # Subir a Google Sheets si se solicita
         if upload_sheets:
+            print("[PROCESS] Uploading to Google Sheets...")
+            sys.stdout.flush()
             spreadsheet_id = request.args.get('spreadsheet_id')
             worksheet_name = request.args.get('worksheet_name', 'Sheet1')
             if spreadsheet_id:
@@ -261,7 +354,11 @@ def process_file():
                     'spreadsheet_id': spreadsheet_id,
                     'worksheet': worksheet_name
                 }
+                print(f"[PROCESS] Google Sheets upload result: {success}")
+                sys.stdout.flush()
             else:
+                print("[PROCESS] Google Sheets upload failed: missing spreadsheet_id")
+                sys.stdout.flush()
                 response_data['uploads']['sheets'] = {
                     'success': False,
                     'message': 'spreadsheet_id is required'
@@ -270,6 +367,8 @@ def process_file():
         # Si no se solicita ninguna subida, devolver el archivo procesado
         if not (upload_bigquery or upload_storage or upload_sheets):
             output_filename = f"processed_{filename}"
+            print(f"[PROCESS] Returning processed file: {output_filename}")
+            sys.stdout.flush()
             return send_file(
                 io.BytesIO(processed_content),
                 mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -278,9 +377,15 @@ def process_file():
             )
         
         # Si se solicitó alguna subida, devolver JSON con la información
+        print("[PROCESS] Request completed successfully")
+        print("=" * 50)
+        sys.stdout.flush()
         return jsonify(response_data), 200
         
     except Exception as e:
+        print(f"[PROCESS] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
         return jsonify({
             'error': 'Processing failed',
             'message': str(e)
@@ -289,4 +394,7 @@ def process_file():
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8750))
+    print(f"Starting Flask server on port {port}")
+    print("=" * 50)
+    sys.stdout.flush()
     app.run(host='0.0.0.0', port=port, debug=True)

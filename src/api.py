@@ -199,21 +199,39 @@ def test_storage_endpoint():
 def process_file():
     """
     Endpoint para procesar un archivo Excel.
-    Recibe un archivo Excel como form-data con el campo "file", lo procesa y devuelve el resultado.
+    Recibe un archivo Excel como form-data con el campo "file", lo procesa y sube automáticamente a Cloud Storage.
+    
+    El archivo procesado se sube automáticamente a Cloud Storage usando las variables de entorno:
+        - GCS_BUCKET_NAME: Nombre del bucket de Cloud Storage (requerido)
+        - GCS_FOLDER_NAME: Carpeta dentro del bucket (opcional, default: 'processed')
     
     Query parameters opcionales:
-        - upload_bigquery: Si está presente, sube el resultado a BigQuery
-        - dataset_id: ID del dataset de BigQuery
-        - table_id: ID de la tabla de BigQuery
-        - upload_storage: Si está presente, sube el resultado a Cloud Storage
-        - bucket_name: Nombre del bucket de Cloud Storage
-        - blob_name: Nombre del blob en Cloud Storage
-        - upload_sheets: Si está presente, sube el resultado a Google Sheets
-        - spreadsheet_id: ID de la hoja de cálculo
-        - worksheet_name: Nombre de la hoja de trabajo
+        - upload_bigquery: Si está presente y es 'true', sube el resultado a BigQuery
+        - dataset_id: ID del dataset de BigQuery (requerido si upload_bigquery=true)
+        - table_id: ID de la tabla de BigQuery (requerido si upload_bigquery=true)
     
     Returns:
-        Archivo Excel procesado o JSON con información del procesamiento
+        JSON con la siguiente estructura:
+        {
+            'success': bool,
+            'message': str,
+            'filename': str,  # Nombre del archivo original
+            'processed_filename': str,  # Nombre del archivo procesado
+            'download_url': str,  # URL pública para descargar el archivo desde Cloud Storage
+            'uploads': {
+                'storage': {
+                    'success': bool,
+                    'bucket': str,
+                    'blob': str,
+                    'url': str
+                },
+                'bigquery': {  # Solo si upload_bigquery=true
+                    'success': bool,
+                    'dataset': str,
+                    'table': str
+                }
+            }
+        }
     """
     print("=" * 50)
     print("[PROCESS] Endpoint called")
@@ -255,10 +273,32 @@ def process_file():
         # Leer el contenido del archivo
         print(f"[PROCESS] Reading file content...")
         sys.stdout.flush()
+        
+        # Asegurarse de que el archivo se lea como bytes
+        # Resetear el stream al inicio por si acaso
+        file.seek(0)
         file_content = file.read()
+        
+        # Verificar que el contenido sea bytes
+        if not isinstance(file_content, bytes):
+            file_content = file_content.encode('utf-8') if isinstance(file_content, str) else bytes(file_content)
+        
         filename = secure_filename(file.filename)
-        print(f"[PROCESS] File size: {len(file_content)} bytes")
-        sys.stdout.flush()
+
+        # Verificar que el archivo no esté vacío
+        if len(file_content) == 0:
+            print("[PROCESS] Error: File is empty")
+            sys.stdout.flush()
+            return jsonify({
+                'error': 'Empty file',
+                'message': 'The uploaded file is empty'
+            }), 400
+        
+        # Verificar que sea un archivo Excel válido (debe empezar con PK para .xlsx o D0CF para .xls)
+        if not (file_content.startswith(b'PK') or file_content.startswith(b'\xd0\xcf')):
+            print("[PROCESS] Warning: File might not be a valid Excel file (doesn't start with expected magic bytes)")
+            sys.stdout.flush()
+            # Continuar de todas formas, podría ser un formato válido
         
         # Obtener credenciales para el procesamiento y los uploads
         credentials, project_id = get_credentials()
@@ -270,20 +310,61 @@ def process_file():
         print(f"[PROCESS] File processed successfully. Output size: {len(processed_content)} bytes")
         sys.stdout.flush()
         
-        # Obtener parámetros opcionales
-        upload_bigquery = request.args.get('upload_bigquery', 'false').lower() == 'true'
-        upload_storage = request.args.get('upload_storage', 'false').lower() == 'true'
-        upload_sheets = request.args.get('upload_sheets', 'false').lower() == 'true'
+        # Obtener configuración de Cloud Storage desde variables de entorno
+        storage_bucket = os.getenv('GCS_BUCKET_NAME')
+        storage_folder = os.getenv('GCS_FOLDER_NAME', 'processed')
         
-        print(f"[PROCESS] Upload options - BigQuery: {upload_bigquery}, Storage: {upload_storage}, Sheets: {upload_sheets}")
-        sys.stdout.flush()
+        # Generar nombre del archivo con timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = os.path.splitext(filename)[0]
+        extension = os.path.splitext(filename)[1] or '.xlsx'
+        output_filename = f"Informe_R011_{timestamp}{extension}"
+        blob_name = f"{storage_folder}/{output_filename}" if storage_folder else output_filename
         
         response_data = {
             'success': True,
             'message': 'File processed successfully',
             'filename': filename,
+            'processed_filename': output_filename,
+            'download_url': None,
             'uploads': {}
         }
+        
+        # Subir a Cloud Storage automáticamente
+        if storage_bucket:
+            print(f"[PROCESS] Uploading to Cloud Storage: gs://{storage_bucket}/{blob_name}")
+            sys.stdout.flush()
+            success, result = venezuela.upload_to_storage(
+                processed_content, credentials, project_id, storage_bucket, blob_name
+            )
+            if success:
+                response_data['download_url'] = result
+                response_data['uploads']['storage'] = {
+                    'success': True,
+                    'bucket': storage_bucket,
+                    'blob': blob_name,
+                    'url': result
+                }
+                print(f"[PROCESS] Cloud Storage upload successful. URL: {result}")
+                sys.stdout.flush()
+            else:
+                response_data['uploads']['storage'] = {
+                    'success': False,
+                    'error': result
+                }
+                print(f"[PROCESS] Cloud Storage upload failed: {result}")
+                sys.stdout.flush()
+        else:
+            print("[PROCESS] Warning: GCS_BUCKET_NAME not configured. File not uploaded to Cloud Storage")
+            sys.stdout.flush()
+            response_data['uploads']['storage'] = {
+                'success': False,
+                'message': 'GCS_BUCKET_NAME environment variable not set'
+            }
+        
+        # Obtener parámetros opcionales para BigQuery
+        upload_bigquery = request.args.get('upload_bigquery', 'false').lower() == 'true'
         
         # Subir a BigQuery si se solicita
         if upload_bigquery:
@@ -312,71 +393,7 @@ def process_file():
                     'message': 'dataset_id and table_id are required'
                 }
         
-        # Subir a Cloud Storage si se solicita
-        if upload_storage:
-            print("[PROCESS] Uploading to Cloud Storage...")
-            sys.stdout.flush()
-            bucket_name = request.args.get('bucket_name')
-            blob_name = request.args.get('blob_name', filename)
-            if bucket_name:
-                success = venezuela.upload_to_storage(
-                    processed_content, credentials, project_id, bucket_name, blob_name
-                )
-                response_data['uploads']['storage'] = {
-                    'success': success,
-                    'bucket': bucket_name,
-                    'blob': blob_name
-                }
-                print(f"[PROCESS] Cloud Storage upload result: {success}")
-                sys.stdout.flush()
-            else:
-                print("[PROCESS] Cloud Storage upload failed: missing bucket_name")
-                sys.stdout.flush()
-                response_data['uploads']['storage'] = {
-                    'success': False,
-                    'message': 'bucket_name is required'
-                }
-        
-        # Subir a Google Sheets si se solicita
-        if upload_sheets:
-            print("[PROCESS] Uploading to Google Sheets...")
-            sys.stdout.flush()
-            spreadsheet_id = request.args.get('spreadsheet_id')
-            worksheet_name = request.args.get('worksheet_name', 'Sheet1')
-            if spreadsheet_id:
-                import pandas as pd
-                df = pd.read_excel(io.BytesIO(processed_content))
-                success = venezuela.upload_to_sheets(
-                    df, credentials, spreadsheet_id, worksheet_name
-                )
-                response_data['uploads']['sheets'] = {
-                    'success': success,
-                    'spreadsheet_id': spreadsheet_id,
-                    'worksheet': worksheet_name
-                }
-                print(f"[PROCESS] Google Sheets upload result: {success}")
-                sys.stdout.flush()
-            else:
-                print("[PROCESS] Google Sheets upload failed: missing spreadsheet_id")
-                sys.stdout.flush()
-                response_data['uploads']['sheets'] = {
-                    'success': False,
-                    'message': 'spreadsheet_id is required'
-                }
-        
-        # Si no se solicita ninguna subida, devolver el archivo procesado
-        if not (upload_bigquery or upload_storage or upload_sheets):
-            output_filename = f"processed_{filename}"
-            print(f"[PROCESS] Returning processed file: {output_filename}")
-            sys.stdout.flush()
-            return send_file(
-                io.BytesIO(processed_content),
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name=output_filename
-            )
-        
-        # Si se solicitó alguna subida, devolver JSON con la información
+        # Siempre devolver JSON con la información (incluyendo la URL de descarga)
         print("[PROCESS] Request completed successfully")
         print("=" * 50)
         sys.stdout.flush()

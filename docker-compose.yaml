@@ -12,5 +12,10 @@ services:
     environment:
       - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
       - PORT=8750
+      # Cloud Storage configuration (can be overridden by .env file)
+      # - GCS_BUCKET_NAME=your-bucket-name
+      # - GCS_FOLDER_NAME=processed
+    env_file:
+      - .env
     restart: unless-stopped
 

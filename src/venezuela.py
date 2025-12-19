@@ -155,39 +155,85 @@ def detect_headers(file_content: bytes, expected_headers: list = None) -> Option
     try:
         # Leer el archivo sin especificar header para buscar manualmente
         print(f"[VENZUELA] Detecting headers...")
+        print(f"[VENZUELA] File content size: {len(file_content)} bytes")
         sys.stdout.flush()
         
-        # Leer las primeras filas del archivo
-        df_temp = pd.read_excel(io.BytesIO(file_content), header=None, nrows=20)
+        # Leer más filas del archivo (hasta 100 para encontrar headers que pueden estar más abajo)
+        max_rows_to_check = 100
+        df_temp = pd.read_excel(io.BytesIO(file_content), header=None, nrows=max_rows_to_check)
+        print(f"[VENZUELA] Read {len(df_temp)} rows for header detection")
+        sys.stdout.flush()
         
         # Normalizar los headers esperados (eliminar espacios, convertir a string)
         expected_normalized = [str(h).strip().lower() for h in expected_headers]
+        print(f"[VENZUELA] Looking for {len(expected_normalized)} expected headers")
+        sys.stdout.flush()
         
         # Buscar en cada fila si contiene los headers esperados
         best_match_row = None
         best_match_count = 0
         
-        for row_idx in range(min(20, len(df_temp))):
+        # Mostrar las primeras filas para debug
+        print(f"[VENZUELA] First 5 rows preview:")
+        for preview_idx in range(min(5, len(df_temp))):
+            row_preview = [str(val).strip()[:30] if pd.notna(val) else '' for val in df_temp.iloc[preview_idx].values[:5]]
+            # Verificar si la fila está completamente vacía
+            is_empty = all(not val or val.strip() == '' for val in row_preview)
+            print(f"[VENZUELA]   Row {preview_idx + 1}: {row_preview} {'(EMPTY)' if is_empty else ''}")
+        sys.stdout.flush()
+        
+        for row_idx in range(len(df_temp)):
             # Obtener los valores de la fila como strings
             row_values = [str(val).strip().lower() if pd.notna(val) else '' for val in df_temp.iloc[row_idx].values]
             
+            # Saltar filas completamente vacías
+            if all(not val or val.strip() == '' for val in row_values):
+                continue
+            
+            # Normalizar también los valores de la fila (eliminar espacios extra, etc.)
+            row_values_normalized = [val.replace(' ', '').replace('\t', '').replace('\n', '') for val in row_values]
+            
             # Contar cuántos headers esperados se encuentran en esta fila
             match_count = 0
+            matched_headers = []
             for expected in expected_normalized:
+                # Buscar el header exacto en la fila (comparación directa)
                 if expected in row_values:
                     match_count += 1
+                    matched_headers.append(expected)
+                else:
+                    # También buscar versión normalizada (sin espacios)
+                    expected_no_spaces = expected.replace(' ', '').replace('\t', '').replace('\n', '')
+                    if expected_no_spaces in row_values_normalized:
+                        match_count += 1
+                        matched_headers.append(expected)
             
             # Si encontramos al menos 5 headers coincidentes, consideramos que es la fila de headers
             if match_count >= 5 and match_count > best_match_count:
                 best_match_count = match_count
                 best_match_row = row_idx
+                print(f"[VENZUELA]   Row {row_idx + 1}: Found {match_count} matches: {matched_headers[:5]}...")
+                sys.stdout.flush()
         
         if best_match_row is not None:
             print(f"[VENZUELA] Headers detected at row {best_match_row + 1} (matched {best_match_count} out of {len(expected_headers)} expected columns)")
             sys.stdout.flush()
             return best_match_row
         else:
-            print(f"[VENZUELA] Warning: Could not detect headers automatically. Using first row as header.")
+            print(f"[VENZUELA] Warning: Could not detect headers automatically (best match was {best_match_count} headers). Using first row as header.")
+            # Buscar la primera fila no vacía
+            first_non_empty_row = None
+            for row_idx in range(len(df_temp)):
+                row_values = [str(val).strip() if pd.notna(val) else '' for val in df_temp.iloc[row_idx].values]
+                if any(val and val.strip() != '' for val in row_values):
+                    first_non_empty_row = row_idx
+                    break
+            
+            if first_non_empty_row is not None:
+                print(f"[VENZUELA] First non-empty row is {first_non_empty_row + 1}")
+                print(f"[VENZUELA] First non-empty row values (first 10): {[str(val).strip()[:30] if pd.notna(val) else '' for val in df_temp.iloc[first_non_empty_row].values[:10]]}")
+            else:
+                print(f"[VENZUELA] First row values (first 10): {[str(val).strip()[:30] if pd.notna(val) else '' for val in df_temp.iloc[0].values[:10]]}")
             sys.stdout.flush()
             return None
             
@@ -2027,9 +2073,9 @@ def upload_to_bigquery(df: pd.DataFrame, credentials, project_id: str,
 
 
 def upload_to_storage(file_content: bytes, credentials, project_id: str,
-                     bucket_name: str, blob_name: str) -> bool:
+                     bucket_name: str, blob_name: str, make_public: bool = True) -> tuple:
     """
-    Sube un archivo a Cloud Storage.
+    Sube un archivo a Cloud Storage y retorna la URL pública.
     
     Args:
         file_content: Contenido del archivo en bytes
@@ -2037,9 +2083,10 @@ def upload_to_storage(file_content: bytes, credentials, project_id: str,
         project_id: ID del proyecto de GCP
         bucket_name: Nombre del bucket
         blob_name: Nombre del blob (archivo) en el bucket
+        make_public: Si True, hace el blob público para acceso directo
         
     Returns:
-        bool: True si fue exitoso, False en caso contrario
+        tuple: (success: bool, url: str) - True y URL si fue exitoso, False y mensaje de error en caso contrario
     """
     try:
         storage_client = storage.Client(credentials=credentials, project=project_id)
@@ -2052,14 +2099,28 @@ def upload_to_storage(file_content: bytes, credentials, project_id: str,
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         
+        # Hacer el blob público si se solicita
+        if make_public:
+            try:
+                blob.make_public()
+                print(f"[VENZUELA] Blob made public")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"[VENZUELA] Warning: Could not make blob public: {str(e)}")
+                print(f"[VENZUELA] The blob might already be public or bucket policy might prevent it")
+                sys.stdout.flush()
+        
+        # Obtener la URL pública
+        public_url = blob.public_url
         print(f"[VENZUELA] File uploaded to Cloud Storage: gs://{bucket_name}/{blob_name}")
+        print(f"[VENZUELA] Public URL: {public_url}")
         sys.stdout.flush()
-        return True
+        return True, public_url
         
     except Exception as e:
         print(f"[VENZUELA] Error uploading to Cloud Storage: {str(e)}")
         sys.stdout.flush()
-        return False
+        return False, str(e)
 
 
 def upload_to_sheets(df: pd.DataFrame, credentials, spreadsheet_id: str, 

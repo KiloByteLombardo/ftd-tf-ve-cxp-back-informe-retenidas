@@ -1646,6 +1646,221 @@ def add_rango_120_plus_column(df: pd.DataFrame) -> pd.DataFrame:
     return df_processed
 
 
+def get_comentarios_from_bigquery(credentials, project_id: str, dataset_id: str, table_id: str, 
+                                   timestamp_column: str = 'vzla_retenida_timestamp') -> pd.DataFrame:
+    """
+    Consulta BigQuery para obtener los comentarios del último timestamp.
+    
+    Args:
+        credentials: Credenciales de GCP
+        project_id: ID del proyecto de BigQuery
+        dataset_id: ID del dataset de BigQuery
+        table_id: ID de la tabla de BigQuery
+        timestamp_column: Nombre de la columna de timestamp (default: 'timestamp')
+        
+    Returns:
+        pd.DataFrame: DataFrame con los comentarios del último timestamp, o DataFrame vacío si hay error
+    """
+    try:
+        print(f"[VENZUELA] Querying BigQuery for latest comentarios: {project_id}.{dataset_id}.{table_id}")
+        sys.stdout.flush()
+        
+        # Si las credenciales fueron limitadas con scopes específicos (ej: solo Google Sheets),
+        # necesitamos recargar las credenciales originales desde el archivo para tener acceso completo.
+        # Para service accounts, normalmente no necesitamos agregar scopes explícitamente
+        # si la cuenta de servicio tiene los roles IAM correctos.
+        
+        # Intentar recargar las credenciales originales si están limitadas
+        credentials_to_use = credentials
+        credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'credentials.json')
+        
+        # Si las credenciales tienen scopes limitados, intentar recargar desde el archivo
+        if hasattr(credentials, 'scopes') and credentials.scopes:
+            # Si tiene scopes limitados, recargar desde el archivo
+            if os.path.exists(credentials_path):
+                try:
+                    print(f"[VENZUELA] Credentials have limited scopes, reloading from file: {credentials_path}")
+                    sys.stdout.flush()
+                    credentials_original, _ = load_credentials_from_file(credentials_path)
+                    credentials_to_use = credentials_original
+                except Exception as e:
+                    print(f"[VENZUELA] Warning: Could not reload credentials, using provided: {str(e)}")
+                    sys.stdout.flush()
+        
+        # Intentar usar las credenciales directamente (service accounts normalmente funcionan sin scopes explícitos)
+        bigquery_client = bigquery.Client(credentials=credentials_to_use, project=project_id)
+        
+        # Para tablas particionadas, BigQuery requiere un filtro directo sobre la columna de partición
+        # Usamos funciones SQL nativas de BigQuery (TIMESTAMP_SUB y CURRENT_TIMESTAMP) para el filtro
+        # Esto es más eficiente y cumple con los requisitos de eliminación de particiones
+        # La consulta obtiene el último timestamp disponible de los últimos 7 días (último día hábil)
+        
+        print(f"[VENZUELA] Querying BigQuery for latest comentarios (last available timestamp from last 7 days, partitioned by {timestamp_column})...")
+        sys.stdout.flush()
+        
+        # Query para obtener los comentarios del último timestamp disponible
+        # Usando la partición vzla_retenida_timestamp para optimizar la consulta
+        # Busca en los últimos 7 días y obtiene el máximo timestamp (último día hábil/disponible)
+        query = f"""
+        WITH max_timestamp AS (
+            SELECT MAX({timestamp_column}) as max_ts
+            FROM `{project_id}.{dataset_id}.{table_id}`
+            WHERE {timestamp_column} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+              AND {timestamp_column} < CURRENT_TIMESTAMP()
+        )
+        SELECT 
+            vzla_retenida_numero_factura,
+            vzla_retenida_comentarios,
+            vzla_retenida_comentario_cxp,
+            {timestamp_column}
+        FROM `{project_id}.{dataset_id}.{table_id}`
+        WHERE {timestamp_column} = (SELECT max_ts FROM max_timestamp)
+          AND {timestamp_column} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+          AND {timestamp_column} < CURRENT_TIMESTAMP()
+        """
+        
+        print(f"[VENZUELA] Executing BigQuery query with partition filter...")
+        sys.stdout.flush()
+        query_job = bigquery_client.query(query)
+        df_result = query_job.to_dataframe()
+        
+        print(f"[VENZUELA] Retrieved {len(df_result)} rows from BigQuery with latest timestamp")
+        sys.stdout.flush()
+        
+        return df_result
+        
+    except Exception as e:
+        print(f"[VENZUELA] Error querying BigQuery for comentarios: {str(e)}")
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+
+def add_comentarios_columns(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
+    """
+    Crea las columnas "Comentario" y "Comentario CXP" consultando BigQuery.
+    
+    Args:
+        df: DataFrame original
+        credentials: Credenciales de GCP (opcional, necesario para consultar BigQuery)
+        
+    Returns:
+        pd.DataFrame: DataFrame con las columnas "Comentario" y "Comentario CXP" agregadas
+    """
+    df_processed = df.copy()
+    
+    # Verificar que exista la columna Número Factura para hacer el pareo
+    if 'Número Factura' not in df_processed.columns:
+        print(f"[VENZUELA] Warning: Column 'Número Factura' not found. Cannot create comentarios columns")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    # Verificar que se proporcionen credenciales
+    if not credentials:
+        print(f"[VENZUELA] Warning: No credentials provided. Cannot create comentarios columns")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    # Cargar variables de entorno desde .env si existe
+    load_env_file()
+    
+    # Obtener las variables de entorno de BigQuery
+    project_id = os.getenv('GCP_PROJECT_ID') or os.getenv('BIGQUERY_PROJECT_ID')
+    dataset_id = os.getenv('BIGQUERY_DATASET_ID')
+    table_id = os.getenv('BIGQUERY_TABLE_ID')
+    timestamp_column = os.getenv('BQ_TIMESTAMP_COLUMN', 'vzla_retenida_timestamp')
+    
+    if not project_id or not dataset_id or not table_id:
+        print(f"[VENZUELA] Warning: BigQuery configuration not found in environment variables")
+        print(f"[VENZUELA] Required: BQ_PROJECT_ID (or BIGQUERY_PROJECT_ID), BQ_DATASET_ID (or BIGQUERY_DATASET_ID), BQ_TABLE_ID (or BIGQUERY_TABLE_ID)")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    print(f"[VENZUELA] Creating 'Comentario' and 'Comentario CXP' columns using BigQuery...")
+    sys.stdout.flush()
+    
+    # Consultar BigQuery para obtener los comentarios
+    df_comentarios = get_comentarios_from_bigquery(credentials, project_id, dataset_id, table_id, timestamp_column)
+    
+    if df_comentarios.empty:
+        print(f"[VENZUELA] Warning: No comentarios found in BigQuery")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    # Verificar que existan las columnas necesarias en el resultado de BigQuery
+    if 'vzla_retenida_numero_factura' not in df_comentarios.columns:
+        print(f"[VENZUELA] Warning: Column 'vzla_retenida_numero_factura' not found in BigQuery result")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    if 'vzla_retenida_comentarios' not in df_comentarios.columns:
+        print(f"[VENZUELA] Warning: Column 'vzla_retenida_comentarios' not found in BigQuery result")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    if 'vzla_retenida_comentario_cxp' not in df_comentarios.columns:
+        print(f"[VENZUELA] Warning: Column 'vzla_retenida_comentario_cxp' not found in BigQuery result")
+        sys.stdout.flush()
+        df_processed['Comentario'] = ''
+        df_processed['Comentario CXP'] = ''
+        return df_processed
+    
+    # Crear diccionarios de pareo
+    comentario_mapping = {}
+    comentario_cxp_mapping = {}
+    
+    for _, row in df_comentarios.iterrows():
+        numero_factura = str(row['vzla_retenida_numero_factura']).strip() if pd.notna(row['vzla_retenida_numero_factura']) else ''
+        comentario = str(row['vzla_retenida_comentarios']).strip() if pd.notna(row['vzla_retenida_comentarios']) else ''
+        comentario_cxp = str(row['vzla_retenida_comentario_cxp']).strip() if pd.notna(row['vzla_retenida_comentario_cxp']) else ''
+        
+        if numero_factura:
+            # Normalizar el número de factura para el pareo
+            numero_factura_normalized = numero_factura.replace(' ', '').replace('\t', '').replace('\n', '').upper()
+            comentario_mapping[numero_factura_normalized] = comentario
+            comentario_cxp_mapping[numero_factura_normalized] = comentario_cxp
+    
+    # Inicializar las nuevas columnas con valores vacíos
+    df_processed['Comentario'] = ''
+    df_processed['Comentario CXP'] = ''
+    
+    # Convertir Número Factura a string para hacer el pareo
+    df_processed['Número Factura'] = df_processed['Número Factura'].astype(str)
+    
+    # Hacer el pareo: buscar cada valor de Número Factura en los diccionarios
+    matched_count = 0
+    for idx, numero_factura in df_processed['Número Factura'].items():
+        # Normalizar el valor de Número Factura eliminando todos los espacios
+        numero_factura_normalized = str(numero_factura).strip().replace(' ', '').replace('\t', '').replace('\n', '').upper()
+        # Buscar coincidencia con la versión normalizada
+        if numero_factura_normalized in comentario_mapping:
+            df_processed.at[idx, 'Comentario'] = comentario_mapping[numero_factura_normalized]
+            matched_count += 1
+        if numero_factura_normalized in comentario_cxp_mapping:
+            df_processed.at[idx, 'Comentario CXP'] = comentario_cxp_mapping[numero_factura_normalized]
+    
+    print(f"[VENZUELA] Matched {matched_count} out of {len(df_processed)} rows with comentarios from BigQuery")
+    if matched_count < len(df_processed):
+        unmatched = len(df_processed) - matched_count
+        print(f"[VENZUELA] Warning: {unmatched} rows could not be matched with comentarios")
+    sys.stdout.flush()
+    
+    return df_processed
+
+
 def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     """
     Procesa el DataFrame según la lógica de negocio para archivos R011.
@@ -1675,6 +1890,7 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     21. Crear columna "90-120" indicando si el rango está entre 90 y 120 días
     22. Crear columna "+120" indicando si el rango es mayor a 120 días
     23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
+    24. Crear columnas "Comentario" y "Comentario CXP" consultando BigQuery con el último timestamp
     
     Args:
         df: DataFrame original
@@ -1759,6 +1975,9 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     
     # 23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
     df_processed = add_especialista_comercial_column(df_processed, credentials)
+    
+    # 24. Crear columnas "Comentario" y "Comentario CXP" consultando BigQuery con el último timestamp
+    df_processed = add_comentarios_columns(df_processed, credentials)
     
     final_rows = len(df_processed)
     print(f"[VENZUELA] Processing completed. Final rows: {final_rows} (removed {initial_rows - final_rows} total)")
@@ -1899,19 +2118,14 @@ def get_credentials_local():
     """
     Obtiene credenciales de GCP para uso local, primero intenta desde credentials.json,
     si no está disponible, usa ADC (Application Default Credentials).
-    Las credenciales incluyen los scopes necesarios para Google Sheets.
+    Para service accounts, no se limitan los scopes ya que los permisos se manejan vía IAM roles.
+    Los scopes solo se agregan cuando es necesario para OAuth flows.
     
     Returns:
         tuple: (credentials, project_id)
     """
     # Para uso local, buscar credentials.json en la raíz del proyecto
     credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'credentials.json')
-    
-    # Scopes necesarios para Google Sheets
-    sheets_scopes = [
-        'https://www.googleapis.com/auth/spreadsheets.readonly',
-        'https://www.googleapis.com/auth/spreadsheets'
-    ]
     
     # Intentar cargar desde credentials.json
     if os.path.exists(credentials_path):
@@ -1920,9 +2134,9 @@ def get_credentials_local():
             sys.stdout.flush()
             credentials, project = load_credentials_from_file(credentials_path)
             
-            # Si las credenciales soportan with_scopes, asegurar que tengan los scopes
-            if hasattr(credentials, 'with_scopes'):
-                credentials = credentials.with_scopes(sheets_scopes)
+            # Para service accounts, no necesitamos agregar scopes explícitamente
+            # Los permisos se manejan a través de IAM roles en GCP
+            # Solo agregar scopes si es necesario para OAuth flows (no es el caso para service accounts)
             
             return credentials, project
         except Exception as e:
@@ -1935,9 +2149,8 @@ def get_credentials_local():
     sys.stdout.flush()
     credentials, project = default()
     
-    # Si las credenciales soportan with_scopes, asegurar que tengan los scopes
-    if hasattr(credentials, 'with_scopes'):
-        credentials = credentials.with_scopes(sheets_scopes)
+    # Para ADC también, no limitar scopes innecesariamente
+    # Los permisos se manejan a través de IAM roles
     
     return credentials, project
 

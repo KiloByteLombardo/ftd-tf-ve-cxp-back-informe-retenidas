@@ -1244,6 +1244,190 @@ def validate_cendis_area(df: pd.DataFrame) -> pd.DataFrame:
     return df_processed
 
 
+def get_especialista_mapping(credentials, spreadsheet_id: str, worksheet_gid: int = 2024277500, worksheet_name: str = 'Maestro Especialista') -> dict:
+    """
+    Lee un Google Sheets y crea un diccionario de pareo entre SUCURSAL y Especialista.
+    
+    Args:
+        credentials: Credenciales de GCP
+        spreadsheet_id: ID del Google Sheets
+        worksheet_gid: GID de la hoja de trabajo (default: 2024277500)
+        worksheet_name: Nombre de la hoja de trabajo (default: 'Maestro Especialista')
+        
+    Returns:
+        dict: Diccionario con SUCURSAL como clave y Especialista como valor
+    """
+    try:
+        print(f"[VENZUELA] Reading especialista mapping from Google Sheets: {spreadsheet_id}/{worksheet_name} (GID: {worksheet_gid})")
+        sys.stdout.flush()
+        
+        # Asegurar que las credenciales tengan los scopes necesarios para Google Sheets
+        if hasattr(credentials, 'with_scopes'):
+            sheets_scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+            credentials_with_scope = credentials.with_scopes(sheets_scopes)
+        elif isinstance(credentials, service_account.Credentials):
+            sheets_scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+            credentials_with_scope = credentials.with_scopes(sheets_scopes)
+        else:
+            credentials_with_scope = credentials
+        
+        gspread_client = gspread.authorize(credentials_with_scope)
+        spreadsheet = gspread_client.open_by_key(spreadsheet_id)
+        
+        # Intentar obtener la hoja por nombre
+        try:
+            worksheet = spreadsheet.worksheet(worksheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            # Si no se encuentra por nombre, listar todas las hojas disponibles para debug
+            try:
+                all_worksheets = spreadsheet.worksheets()
+                available_sheets = [ws.title for ws in all_worksheets]
+                print(f"[VENZUELA] Error: Worksheet '{worksheet_name}' (GID: {worksheet_gid}) not found")
+                print(f"[VENZUELA] Available worksheets: {available_sheets}")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"[VENZUELA] Error listing worksheets: {str(e)}")
+                sys.stdout.flush()
+            return {}
+        except Exception as e:
+            print(f"[VENZUELA] Error accessing worksheet: {str(e)}")
+            sys.stdout.flush()
+            return {}
+        
+        # Obtener todos los valores de la hoja
+        all_values = worksheet.get_all_values()
+        
+        if not all_values or len(all_values) < 2:
+            print(f"[VENZUELA] Warning: Google Sheets is empty or has no data rows")
+            sys.stdout.flush()
+            return {}
+        
+        # La primera fila son los encabezados
+        headers = [h.strip() for h in all_values[0]]
+        
+        # Buscar los índices de las columnas
+        # Los cabezales son: COD PROVEEDOR, SUCURSAL, CONDICION, Especialista, CATEGORIAS, GERENTES
+        if 'SUCURSAL' not in headers:
+            print(f"[VENZUELA] Error: Column 'SUCURSAL' not found in Google Sheets. Headers: {headers}")
+            sys.stdout.flush()
+            return {}
+        
+        # Buscar "Especialista"
+        especialista_idx = None
+        for i, h in enumerate(headers):
+            if h.strip().upper() == 'ESPECIALISTA':
+                especialista_idx = i
+                break
+        
+        if especialista_idx is None:
+            print(f"[VENZUELA] Error: Column 'Especialista' not found in Google Sheets. Headers: {headers}")
+            sys.stdout.flush()
+            return {}
+        
+        sucursal_idx = headers.index('SUCURSAL')
+        
+        # Crear el diccionario de pareo
+        mapping = {}
+        
+        for row in all_values[1:]:  # Saltar la fila de encabezados
+            if len(row) > max(sucursal_idx, especialista_idx):
+                sucursal = str(row[sucursal_idx]).strip() if row[sucursal_idx] else ''
+                especialista = str(row[especialista_idx]).strip() if row[especialista_idx] else ''
+                
+                if sucursal:  # Solo agregar si hay un nombre de sucursal
+                    # Normalizar la sucursal eliminando espacios para el pareo
+                    sucursal_normalized = sucursal.replace(' ', '').replace('\t', '').replace('\n', '').upper()
+                    mapping[sucursal_normalized] = especialista
+        
+        print(f"[VENZUELA] Loaded {len(mapping)} especialista mappings from Google Sheets")
+        sys.stdout.flush()
+        return mapping
+        
+    except Exception as e:
+        print(f"[VENZUELA] Error reading especialista mapping from Google Sheets: {str(e)}")
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return {}
+
+
+def add_especialista_comercial_column(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
+    """
+    Crea la columna "Especialista Comercial" haciendo pareo con Google Sheets.
+    Hace pareo entre la columna "Sucursal" del reporte y "SUCURSAL" del Google Sheets.
+    
+    Args:
+        df: DataFrame original
+        credentials: Credenciales de GCP (opcional, necesario para pareo con Google Sheets)
+        
+    Returns:
+        pd.DataFrame: DataFrame con la columna "Especialista Comercial" agregada
+    """
+    df_processed = df.copy()
+    
+    # Verificar que exista la columna Sucursal
+    if 'Sucursal' not in df_processed.columns:
+        print(f"[VENZUELA] Warning: Column 'Sucursal' not found. Cannot create 'Especialista Comercial' column")
+        sys.stdout.flush()
+        df_processed['Especialista Comercial'] = ''
+        return df_processed
+    
+    # Verificar que se proporcionen credenciales
+    if not credentials:
+        print(f"[VENZUELA] Warning: No credentials provided. Cannot create 'Especialista Comercial' column")
+        sys.stdout.flush()
+        df_processed['Especialista Comercial'] = ''
+        return df_processed
+    
+    # Cargar variables de entorno desde .env si existe
+    load_env_file()
+    
+    # Obtener el ID del Google Sheets desde variables de entorno
+    spreadsheet_id = os.getenv('SHEETS_PROVIDER_MAPPING_ID')
+    if not spreadsheet_id:
+        print(f"[VENZUELA] Warning: SHEETS_PROVIDER_MAPPING_ID not found in environment variables")
+        sys.stdout.flush()
+        df_processed['Especialista Comercial'] = ''
+        return df_processed
+    
+    print(f"[VENZUELA] Creating 'Especialista Comercial' column using Google Sheets mapping...")
+    sys.stdout.flush()
+    
+    # Obtener el mapeo de especialistas desde Google Sheets
+    especialista_mapping = get_especialista_mapping(credentials, spreadsheet_id)
+    
+    if not especialista_mapping:
+        print(f"[VENZUELA] Warning: Could not load especialista mapping from Google Sheets")
+        sys.stdout.flush()
+        df_processed['Especialista Comercial'] = ''
+        return df_processed
+    
+    # Inicializar la nueva columna con valores vacíos
+    df_processed['Especialista Comercial'] = ''
+    
+    # Convertir Sucursal a string para hacer el pareo
+    df_processed['Sucursal'] = df_processed['Sucursal'].astype(str)
+    
+    # Hacer el pareo: buscar cada valor de Sucursal en el diccionario
+    # Normalizar eliminando todos los espacios para hacer el pareo más efectivo
+    matched_count = 0
+    for idx, sucursal in df_processed['Sucursal'].items():
+        # Normalizar el valor de Sucursal eliminando todos los espacios (incluyendo tabs y newlines)
+        sucursal_normalized = str(sucursal).strip().replace(' ', '').replace('\t', '').replace('\n', '').upper()
+        # Buscar coincidencia con la versión normalizada
+        if sucursal_normalized in especialista_mapping:
+            df_processed.at[idx, 'Especialista Comercial'] = especialista_mapping[sucursal_normalized]
+            matched_count += 1
+    
+    print(f"[VENZUELA] Matched {matched_count} out of {len(df_processed)} rows with sucursal-especialista mapping")
+    if matched_count < len(df_processed):
+        unmatched = len(df_processed) - matched_count
+        print(f"[VENZUELA] Warning: {unmatched} rows could not be matched with sucursal-especialista mapping")
+    sys.stdout.flush()
+    
+    return df_processed
+
+
 def add_rango_fecha_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Crea la columna "Rango de fecha" calculando la diferencia en días entre la fecha de hoy y "Fecha Recepción".
@@ -1267,19 +1451,20 @@ def add_rango_fecha_column(df: pd.DataFrame) -> pd.DataFrame:
     sys.stdout.flush()
     
     # Obtener la fecha de hoy
-    fecha_hoy = date.today()
+    fecha_hoy = pd.Timestamp(date.today())
     
     # Convertir "Fecha Recepción" a datetime si no lo es
     df_processed['Fecha Recepción'] = pd.to_datetime(df_processed['Fecha Recepción'], errors='coerce')
     
-    # Calcular la diferencia en días
-    df_processed['Rango de fecha'] = (fecha_hoy - df_processed['Fecha Recepción'].dt.date).dt.days
+    # Calcular la diferencia en días usando timedelta
+    # Restar fecha_hoy - Fecha Recepción para obtener días transcurridos
+    df_processed['Rango de fecha'] = (fecha_hoy - df_processed['Fecha Recepción']).dt.days
     
     # Reemplazar valores NaN con 0
     df_processed['Rango de fecha'] = df_processed['Rango de fecha'].fillna(0).astype(int)
     
     # Contador para estadísticas
-    valid_dates = df_processed['Rango de fecha'].notna().sum()
+    valid_dates = (df_processed['Fecha Recepción'].notna()).sum()
     print(f"[VENZUELA] Rango de fecha column created. Valid dates: {valid_dates} out of {len(df_processed)}")
     sys.stdout.flush()
     
@@ -1489,6 +1674,7 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     20. Crear columna "60-90" indicando si el rango está entre 60 y 90 días
     21. Crear columna "90-120" indicando si el rango está entre 90 y 120 días
     22. Crear columna "+120" indicando si el rango es mayor a 120 días
+    23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
     
     Args:
         df: DataFrame original
@@ -1570,6 +1756,9 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     
     # 22. Crear columna "+120" indicando si el rango es mayor a 120 días
     df_processed = add_rango_120_plus_column(df_processed)
+    
+    # 23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
+    df_processed = add_especialista_comercial_column(df_processed, credentials)
     
     final_rows = len(df_processed)
     print(f"[VENZUELA] Processing completed. Final rows: {final_rows} (removed {initial_rows - final_rows} total)")

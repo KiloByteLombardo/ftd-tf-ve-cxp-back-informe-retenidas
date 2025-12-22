@@ -1936,7 +1936,7 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     21. Crear columna "90-120" indicando si el rango está entre 90 y 120 días
     22. Crear columna "+120" indicando si el rango es mayor a 120 días
     23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
-    24. Crear columnas "Comentario" y "Comentario CXP" consultando BigQuery con el último timestamp
+    24. Crear columnas "Comentario" y "Comentario CXP" - Se hace en la API usando df_old_grist (no BigQuery)
     
     Args:
         df: DataFrame original
@@ -2022,8 +2022,8 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     # 23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
     df_processed = add_especialista_comercial_column(df_processed, credentials)
     
-    # 24. Crear columnas "Comentario" y "Comentario CXP" consultando BigQuery con el último timestamp
-    df_processed = add_comentarios_columns(df_processed, credentials)
+    # 24. Crear columnas "Comentario" y "Comentario CXP" - NO se hace aquí, se hace en la API usando df_old_grist
+    # df_processed = add_comentarios_columns(df_processed, credentials)  # Deshabilitado - se hace en API
     
     final_rows = len(df_processed)
     print(f"[VENZUELA] Processing completed. Final rows: {final_rows} (removed {initial_rows - final_rows} total)")

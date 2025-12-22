@@ -219,3 +219,5 @@ deploy-r011.ps1
 deploy-r011.sh
 deploy-r011.bat
 deploy-r011.sh
+
+grist_debug/

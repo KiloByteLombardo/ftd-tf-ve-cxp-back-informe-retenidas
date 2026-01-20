@@ -5,9 +5,14 @@ import pandas as pd
 from google.cloud import bigquery, storage
 from google.auth import default, load_credentials_from_file
 from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import gspread
 from typing import Tuple, Optional
 from datetime import datetime, date
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 
 def load_env_file(env_path: str = '.env'):
@@ -1783,6 +1788,355 @@ def get_comentarios_from_bigquery(credentials, project_id: str, dataset_id: str,
         return pd.DataFrame()
 
 
+def add_drive_preview_links_column(df: pd.DataFrame, credentials=None, 
+                                   drive_folder_1: str = None,
+                                   drive_folder_2: str = None,
+                                   drive_folder_3: str = None,
+                                   drive_folder_4: str = None,
+                                   drive_folder_5: str = None) -> pd.DataFrame:
+    """
+    Crea una columna "Links Drive Preview" con links de preview de archivos en Google Drive.
+    Busca archivos en 5 carpetas de Google Drive usando el campo "Orden Compra".
+    
+    Args:
+        df: DataFrame original
+        credentials: Credenciales de GCP (opcional, necesario para consultar Google Drive)
+        drive_folder_1: ID de la primera carpeta de Google Drive
+        drive_folder_2: ID de la segunda carpeta de Google Drive
+        drive_folder_3: ID de la tercera carpeta de Google Drive
+        drive_folder_4: ID de la cuarta carpeta de Google Drive
+        drive_folder_5: ID de la quinta carpeta de Google Drive
+        
+    Returns:
+        pd.DataFrame: DataFrame con la columna "Links Drive Preview" agregada (tipo JSON string)
+    """
+    df_processed = df.copy()
+    
+    # Verificar que exista la columna Orden Compra
+    if 'Orden Compra' not in df_processed.columns:
+        print(f"[VENZUELA] Warning: Column 'Orden Compra' not found. Cannot create 'Links Drive Preview' column")
+        sys.stdout.flush()
+        df_processed['Links Drive Preview'] = '{}'
+        return df_processed
+    
+    # Verificar que se proporcionen credenciales
+    if not credentials:
+        print(f"[VENZUELA] Warning: No credentials provided. Cannot create 'Links Drive Preview' column")
+        sys.stdout.flush()
+        df_processed['Links Drive Preview'] = '{}'
+        return df_processed
+    
+    # Cargar variables de entorno desde .env si existe
+    load_env_file()
+    
+    # Obtener los IDs de las carpetas desde variables de entorno o parámetros
+    folders = []
+    if drive_folder_1:
+        folders.append(drive_folder_1)
+    elif os.getenv('DRIVE_FOLDER_1'):
+        folders.append(os.getenv('DRIVE_FOLDER_1'))
+    
+    if drive_folder_2:
+        folders.append(drive_folder_2)
+    elif os.getenv('DRIVE_FOLDER_2'):
+        folders.append(os.getenv('DRIVE_FOLDER_2'))
+    
+
+    
+    if not folders:
+        print(f"[VENZUELA] Warning: No Drive folder IDs provided. Cannot create 'Links Drive Preview' column")
+        print(f"[VENZUELA] Provide folder IDs via parameters or environment variables: DRIVE_FOLDER_1, DRIVE_FOLDER_2, etc.")
+        sys.stdout.flush()
+        df_processed['Links Drive Preview'] = '{}'
+        return df_processed
+    
+    print(f"[VENZUELA] Creating 'Links Drive Preview' column using Google Drive API...")
+    print(f"[VENZUELA] Searching in {len(folders)} folder(s)")
+    sys.stdout.flush()
+    
+    # Inicializar la columna con JSON vacío
+    df_processed['Links Drive Preview'] = '{}'
+    
+    # Convertir Orden Compra a string para procesamiento
+    df_processed['Orden Compra'] = df_processed['Orden Compra'].astype(str)
+    
+    # Crear servicio de Google Drive
+    try:
+        # Construir el servicio de Drive con cache deshabilitado para evitar problemas
+        import googleapiclient.discovery_cache
+        # Deshabilitar cache para evitar warnings (os ya está importado al inicio del archivo)
+        os.environ['GOOGLE_API_USE_MTLS'] = 'never'
+        
+        drive_service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
+        print(f"[VENZUELA] Drive service created successfully")
+        sys.stdout.flush()
+        
+        # Hacer una prueba rápida para verificar que el servicio funciona
+        try:
+            test_query = f"'{folders[0] if folders else ''}' in parents and trashed=false"
+            test_results = drive_service.files().list(
+                q=test_query,
+                fields="files(id)",
+                pageSize=1,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            print(f"[VENZUELA] Drive service test successful - can access folders")
+            sys.stdout.flush()
+        except Exception as test_error:
+            print(f"[VENZUELA] Warning: Drive service test failed: {str(test_error)}")
+            print(f"[VENZUELA] This might indicate permission issues. Continuing anyway...")
+            sys.stdout.flush()
+        
+    except Exception as e:
+        print(f"[VENZUELA] Error creating Drive service: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        df_processed['Links Drive Preview'] = '{}'
+        return df_processed
+    
+    # Función auxiliar para crear un servicio de Drive (thread-safe)
+    def create_drive_service():
+        """Crea una nueva instancia del servicio de Drive para uso en threads"""
+        try:
+            return build('drive', 'v3', credentials=credentials, cache_discovery=False)
+        except Exception as e:
+            print(f"[VENZUELA] Error creating Drive service in thread: {str(e)}")
+            sys.stdout.flush()
+            return None
+    
+    # Función auxiliar para buscar archivo en una carpeta
+    def search_file_in_folder(drive_service_instance, folder_id: str, search_term: str) -> Optional[str]:
+        """
+        Busca un archivo en una carpeta de Google Drive por nombre.
+        
+        Args:
+            drive_service_instance: Instancia del servicio de Drive (una por thread)
+            folder_id: ID de la carpeta de Google Drive
+            search_term: Término de búsqueda (número de OC)
+            
+        Returns:
+            str: ID del archivo encontrado, o None si no se encuentra
+        """
+        if not drive_service_instance:
+            return None
+            
+        try:
+            # Buscar archivos en la carpeta que contengan el término de búsqueda en el nombre
+            # Usar 'name contains' para buscar por nombre
+            # Escapar comillas simples en el término de búsqueda para evitar errores en la query
+            search_term_escaped = search_term.replace("'", "\\'")
+            query = f"'{folder_id}' in parents and name contains '{search_term_escaped}' and trashed=false"
+            
+            # Agregar timeout y manejo de errores más robusto
+            import time
+            start_time = time.time()
+            
+            results = drive_service_instance.files().list(
+                q=query,
+                fields="files(id, name, mimeType)",
+                pageSize=10,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            
+            elapsed_time = time.time() - start_time
+            
+            items = results.get('files', [])
+            
+            if items:
+                # Si encuentra archivos, retornar el ID del primero
+                file_id = items[0]['id']
+                file_name = items[0]['name']
+                print(f"[VENZUELA] Found file in folder {folder_id}: {file_name} (ID: {file_id}) - Search took {elapsed_time:.2f}s")
+                sys.stdout.flush()
+                return file_id
+            
+            return None
+            
+        except HttpError as error:
+            error_details = error.error_details if hasattr(error, 'error_details') else str(error)
+            print(f"[VENZUELA] HTTP Error searching in folder {folder_id} for '{search_term}': {error_details}")
+            sys.stdout.flush()
+            return None
+        except Exception as e:
+            print(f"[VENZUELA] Unexpected error searching in folder {folder_id} for '{search_term}': {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
+            return None
+    
+    # Preparar datos para procesamiento
+    rows_to_process = []
+    for idx, row in df_processed.iterrows():
+        orden_compra = str(row['Orden Compra']).strip()
+        if orden_compra and orden_compra.lower() not in ['nan', 'none', '']:
+            rows_to_process.append((idx, orden_compra))
+    
+    total_rows = len(rows_to_process)
+    print(f"[VENZUELA] Processing {total_rows} rows to search for Drive files in parallel batches...")
+    sys.stdout.flush()
+    
+    # Dividir en lotes de facturas (configurable por variable de entorno)
+    # Por defecto 100 facturas por lote
+    batch_size_env = os.getenv('DRIVE_BATCH_SIZE')
+    if batch_size_env:
+        try:
+            batch_size = int(batch_size_env)
+            if batch_size < 1:
+                batch_size = 100
+        except:
+            batch_size = 100
+    else:
+        batch_size = 100
+    
+    batches = []
+    for i in range(0, len(rows_to_process), batch_size):
+        batches.append(rows_to_process[i:i + batch_size])
+    
+    print(f"[VENZUELA] Created {len(batches)} batches of up to {batch_size} invoices each")
+    sys.stdout.flush()
+    
+    # Función para procesar un lote completo (para usar en threads)
+    def process_batch(batch_data):
+        """Procesa un lote de facturas buscando archivos en Drive"""
+        thread_name, batch = batch_data
+        import threading
+        threading.current_thread().name = thread_name
+        
+        # Crear una instancia del servicio de Drive para este thread
+        thread_drive_service = create_drive_service()
+        if not thread_drive_service:
+            print(f"[{thread_name}] Error: Could not create Drive service")
+            sys.stdout.flush()
+            return {}
+        
+        print(f"[{thread_name}] Started processing batch of {len(batch)} invoices")
+        sys.stdout.flush()
+        
+        batch_results = {}
+        batch_matched = 0
+        
+        for idx, orden_compra in batch:
+            # Buscar en cada carpeta hasta encontrar un archivo
+            found_file_id = None
+            found_folder_idx = None
+            
+            for folder_idx, folder_id in enumerate(folders, 1):
+                if not folder_id or folder_id.strip() == '':
+                    continue
+                
+                try:
+                    file_id = search_file_in_folder(thread_drive_service, folder_id.strip(), orden_compra)
+                    
+                    if file_id:
+                        found_file_id = file_id
+                        found_folder_idx = folder_idx
+                        break  # Detenerse cuando encuentra uno
+                except Exception as e:
+                    # No imprimir cada error individual para no saturar los logs
+                    continue
+            
+            # Si se encontró un archivo, crear el link de preview
+            if found_file_id:
+                preview_link = f"https://drive.google.com/file/d/{found_file_id}/preview"
+                
+                # Crear el JSON con la información
+                links_data = {
+                    "file_id": found_file_id,
+                    "preview_link": preview_link,
+                    "folder_number": found_folder_idx,
+                    "orden_compra": orden_compra
+                }
+                
+                # Guardar resultado
+                batch_results[idx] = json.dumps(links_data, ensure_ascii=False)
+                batch_matched += 1
+            else:
+                # No se encontró archivo, mantener JSON vacío
+                batch_results[idx] = '{}'
+        
+        print(f"[{thread_name}] Completed: {batch_matched}/{len(batch)} files found")
+        sys.stdout.flush()
+        return batch_results
+    
+    # Contadores thread-safe
+    processed_count_lock = Lock()
+    processed_count = 0
+    matched_count = 0
+    
+    # Procesar lotes en paralelo con ThreadPoolExecutor
+    # Usar máximo 5 threads para evitar problemas de memoria
+    max_threads_env = os.getenv('DRIVE_MAX_THREADS')
+    if max_threads_env:
+        try:
+            max_threads = min(int(max_threads_env), len(batches))
+        except:
+            max_threads = min(5, len(batches))
+    else:
+        max_threads = min(5, len(batches))
+    
+    print(f"[VENZUELA] Using {max_threads} parallel threads (Thread-Drive_1 to Thread-Drive_{max_threads})")
+    sys.stdout.flush()
+    
+    results_dict = {}
+    
+    # Preparar lotes con nombres de threads
+    batch_tasks = []
+    for i, batch in enumerate(batches, 1):
+        thread_name = f"Thread-Drive_{i}"
+        batch_tasks.append((thread_name, batch))
+    
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        # Enviar todos los lotes
+        future_to_batch = {executor.submit(process_batch, batch_task): batch_task for batch_task in batch_tasks}
+        
+        # Procesar resultados conforme se completan
+        for future in as_completed(future_to_batch):
+            try:
+                batch_results = future.result()
+                
+                # Actualizar contadores de forma thread-safe
+                with processed_count_lock:
+                    processed_count += len(batch_results)
+                    matched_in_batch = sum(1 for v in batch_results.values() if v != '{}')
+                    matched_count += matched_in_batch
+                    
+                    print(f"[VENZUELA] Progress: {processed_count}/{total_rows} rows processed, {matched_count} files found")
+                    sys.stdout.flush()
+                
+                # Agregar resultados al diccionario principal
+                results_dict.update(batch_results)
+                    
+            except Exception as e:
+                print(f"[VENZUELA] Error processing batch: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+                # En caso de error, agregar JSON vacío para las filas del lote
+                batch_task = future_to_batch[future]
+                for idx, _ in batch_task[1]:
+                    results_dict[idx] = '{}'
+    
+    # Aplicar resultados al DataFrame
+    for idx, json_data in results_dict.items():
+        df_processed.at[idx, 'Links Drive Preview'] = json_data
+    
+    # Para filas que no se procesaron (orden_compra vacío), mantener JSON vacío
+    for idx, row in df_processed.iterrows():
+        if idx not in results_dict:
+            df_processed.at[idx, 'Links Drive Preview'] = '{}'
+    
+    print(f"[VENZUELA] Matched {matched_count} out of {len(df_processed)} rows with Drive files")
+    if matched_count < len(df_processed):
+        unmatched = len(df_processed) - matched_count
+        print(f"[VENZUELA] {unmatched} rows without matching Drive files")
+    sys.stdout.flush()
+    
+    return df_processed
+
+
 def add_comentarios_columns(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     """
     Crea las columnas "Comentario" y "Comentario CXP" consultando BigQuery.
@@ -2022,8 +2376,8 @@ def process_dataframe(df: pd.DataFrame, credentials=None) -> pd.DataFrame:
     # 23. Crear columna "Especialista Comercial" haciendo pareo con Google Sheets (Maestro Especialista)
     df_processed = add_especialista_comercial_column(df_processed, credentials)
     
-    # 24. Crear columnas "Comentario" y "Comentario CXP" - NO se hace aquí, se hace en la API usando df_old_grist
-    # df_processed = add_comentarios_columns(df_processed, credentials)  # Deshabilitado - se hace en API
+    # 24. Crear columna "Links Drive Preview" - Busca archivos en Google Drive por Orden Compra
+    df_processed = add_drive_preview_links_column(df_processed, credentials)
     
     final_rows = len(df_processed)
     print(f"[VENZUELA] Processing completed. Final rows: {final_rows} (removed {initial_rows - final_rows} total)")

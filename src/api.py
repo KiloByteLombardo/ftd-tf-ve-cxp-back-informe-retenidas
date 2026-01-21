@@ -888,12 +888,25 @@ def process_grist(df_processed, credentials=None, project_id=None, df_old_grist=
         df_processed_dict = convert_to_json_serializable(df_processed_dict)
         
         # Subir en lotes para evitar error 413 (request entity too large)
-        batch_size = 500  # Número de filas por lote
+        # El tamaño del lote es configurable mediante variable de entorno
+        # Por defecto 100 filas (reducido porque "Links Drive Preview" puede ser grande)
+        grist_batch_size_env = os.getenv('GRIST_BATCH_SIZE')
+        if grist_batch_size_env:
+            try:
+                batch_size = int(grist_batch_size_env)
+                if batch_size < 1:
+                    batch_size = 100
+            except:
+                batch_size = 100
+        else:
+            batch_size = 100  # Reducido de 500 a 100 por defecto
+        
         total_rows = len(df_processed_dict)
         uploaded_rows = 0
         failed_batches = []
         
         print(f"[GRIST] Uploading {total_rows} rows in batches of {batch_size}...")
+        print(f"[GRIST] Note: Batch size can be configured with GRIST_BATCH_SIZE environment variable")
         sys.stdout.flush()
         
         for i in range(0, total_rows, batch_size):
@@ -901,14 +914,25 @@ def process_grist(df_processed, credentials=None, project_id=None, df_old_grist=
             batch_num = (i // batch_size) + 1
             total_batches = (total_rows + batch_size - 1) // batch_size
             
-            # Calcular tamaño aproximado del batch en bytes
+            # Calcular tamaño aproximado del batch en bytes ANTES de limpiar
             try:
                 batch_json = json.dumps(batch)
                 batch_size_bytes = len(batch_json.encode('utf-8'))
                 batch_size_mb = batch_size_bytes / (1024 * 1024)
+                batch_size_kb = batch_size_bytes / 1024
             except Exception as e:
                 batch_size_mb = 0
+                batch_size_kb = 0
+                batch_size_bytes = 0
                 print(f"[GRIST] Warning: Could not calculate batch size: {str(e)}")
+                sys.stdout.flush()
+            
+            # Verificar si el batch es demasiado grande (más de 5MB es probable que falle)
+            MAX_BATCH_SIZE_MB = 5.0
+            if batch_size_mb > MAX_BATCH_SIZE_MB:
+                print(f"[GRIST] WARNING: Batch {batch_num} is too large ({batch_size_mb:.2f} MB)")
+                print(f"[GRIST] Grist typically has a limit around 5-10 MB per request")
+                print(f"[GRIST] Consider reducing GRIST_BATCH_SIZE environment variable (current: {batch_size})")
                 sys.stdout.flush()
             
             # Mostrar información del batch
@@ -916,7 +940,7 @@ def process_grist(df_processed, credentials=None, project_id=None, df_old_grist=
             print(f"[GRIST] Batch {batch_num}/{total_batches} Details:")
             print(f"[GRIST]   - Rows in batch: {len(batch)}")
             print(f"[GRIST]   - Row range: {i+1} to {min(i+batch_size, total_rows)}")
-            #print(f"[GRIST]   - Approximate size: {batch_size_mb:.2f} MB ({batch_size_bytes:,} bytes)")
+            print(f"[GRIST]   - Approximate size: {batch_size_mb:.2f} MB ({batch_size_kb:.2f} KB, {batch_size_bytes:,} bytes)")
             print(f"[GRIST]   - Columns: {len(batch[0].keys()) if batch else 0}")
             if batch:
                 # Verificar que todas las claves sean strings válidos
@@ -976,6 +1000,26 @@ def process_grist(df_processed, credentials=None, project_id=None, df_old_grist=
                 cleaned_batch.append(cleaned_record)
             
             batch = cleaned_batch
+            
+            # Recalcular el tamaño después de limpiar (puede ser diferente)
+            try:
+                cleaned_batch_json = json.dumps(batch)
+                cleaned_batch_size_bytes = len(cleaned_batch_json.encode('utf-8'))
+                cleaned_batch_size_mb = cleaned_batch_size_bytes / (1024 * 1024)
+                cleaned_batch_size_kb = cleaned_batch_size_bytes / 1024
+                
+                MAX_BATCH_SIZE_MB = 5.0
+                if cleaned_batch_size_mb > MAX_BATCH_SIZE_MB:
+                    print(f"[GRIST] WARNING: Cleaned batch {batch_num} is too large ({cleaned_batch_size_mb:.2f} MB)")
+                    print(f"[GRIST] Grist typically has a limit around 5-10 MB per request")
+                    print(f"[GRIST] Consider reducing GRIST_BATCH_SIZE environment variable (current: {batch_size})")
+                    sys.stdout.flush()
+                else:
+                    print(f"[GRIST] Cleaned batch size: {cleaned_batch_size_mb:.2f} MB ({cleaned_batch_size_kb:.2f} KB)")
+                    sys.stdout.flush()
+            except Exception as e:
+                print(f"[GRIST] Warning: Could not calculate cleaned batch size: {str(e)}")
+                sys.stdout.flush()
             
             # Mostrar el mapeo de columnas normalizadas
             if column_mapping:

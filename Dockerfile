@@ -22,5 +22,6 @@ EXPOSE 8750
 ENV PORT=8750
 
 # Comando para ejecutar la aplicación
-CMD ["gunicorn", "--bind", "0.0.0.0:8750", "--workers", "2", "--timeout", "120", "--chdir", "/app/src", "api:app"]
+# Timeout aumentado a 900s (15 min) para soportar búsquedas de Drive con muchas filas
+CMD ["gunicorn", "--bind", "0.0.0.0:8750", "--workers", "2", "--timeout", "900", "--graceful-timeout", "900", "--chdir", "/app/src", "api:app"]
 

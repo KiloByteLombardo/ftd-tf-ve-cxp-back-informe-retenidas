@@ -7,14 +7,23 @@ services:
     volumes:
       # Montar credentials.json para desarrollo local
       - ./credentials.json:/app/credentials.json:ro
+      - ./client_secret.json:/app/client_secret.json:ro
+      # Montar directorio para tokens de Gmail (se crea automáticamente)
+      - ./gmail_tokens:/app/gmail_tokens
       # Montar el código fuente para desarrollo (opcional, para hot-reload)
       - ./src:/app/src
     environment:
       - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+      - GMAIL_CLIENT_SECRET_PATH=/app/client_secret.json
+      - GMAIL_TOKEN_PATH=/app/gmail_tokens/gmail_token.json
       - PORT=8750
       # Cloud Storage configuration (can be overridden by .env file)
       # - GCS_BUCKET_NAME=your-bucket-name
       # - GCS_FOLDER_NAME=processed
+      # Email Sheet configuration (can be overridden by .env file)
+      # - EMAIL_SPREADSHEET_ID=your-spreadsheet-id
+      # - EMAIL_WORKSHEET_NAME=Sheet1
+      # - EMAIL_WORKSHEET_GID=0
     env_file:
       - .env
     restart: unless-stopped

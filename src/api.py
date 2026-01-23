@@ -9,6 +9,7 @@ from werkzeug.utils import secure_filename
 import io
 import logging
 import venezuela
+import emailSend
 import requests
 import json
 
@@ -34,6 +35,11 @@ HEADERS = {
 SERVER_URL = os.getenv("GRIST_SERVER_URL")
 DOC_ID = os.getenv("GRIST_DOC_ID")
 TABLE_ID = os.getenv("GRIST_TABLE_ID")
+
+# Configuración del Google Sheet para emails
+EMAIL_SPREADSHEET_ID = os.getenv("EMAIL_SPREADSHEET_ID")
+EMAIL_WORKSHEET_NAME = os.getenv("EMAIL_WORKSHEET_NAME", "Sheet1")
+EMAIL_WORKSHEET_GID = os.getenv("EMAIL_WORKSHEET_GID")  # GID numérico de la hoja (opcional)
 
 def get_credentials():
     """
@@ -1202,6 +1208,836 @@ def process_grist(df_processed, credentials=None, project_id=None, df_old_grist=
         result['errors'].append(error_msg)
         return result
 
+
+
+# ============================================================================
+# ENDPOINTS DE AUTENTICACIÓN GMAIL (OAuth2)
+# ============================================================================
+
+@app.route('/auth/gmail/status', methods=['GET'])
+def gmail_auth_status():
+    """
+    Verifica el estado de la autorización de Gmail OAuth2.
+    
+    Returns:
+        JSON con el estado de la autorización:
+        {
+            "authorized": true/false,
+            "email": "usuario@gmail.com" (si autorizado),
+            "token_exists": true/false,
+            "token_valid": true/false
+        }
+    """
+    print("=" * 50)
+    print("[GMAIL-AUTH] Checking authorization status")
+    sys.stdout.flush()
+    
+    status = emailSend.check_gmail_auth_status()
+    
+    print(f"[GMAIL-AUTH] Status: authorized={status.get('authorized')}, email={status.get('email')}")
+    print("=" * 50)
+    sys.stdout.flush()
+    
+    return jsonify(status), 200
+
+
+@app.route('/auth/gmail', methods=['GET'])
+def gmail_auth_start():
+    """
+    Inicia el flujo de autorización OAuth2 para Gmail.
+    Retorna la URL donde el usuario debe autorizar la aplicación.
+    
+    Query Parameters:
+        - redirect_uri: URI de redirección después de autorizar (opcional)
+                       Si no se proporciona, usa la configurada en client_secret.json
+    
+    Returns:
+        JSON con la URL de autorización:
+        {
+            "success": true,
+            "authorization_url": "https://accounts.google.com/...",
+            "state": "...",
+            "instructions": "..."
+        }
+    """
+    print("=" * 50)
+    print("[GMAIL-AUTH] Starting OAuth2 flow")
+    sys.stdout.flush()
+    
+    # Obtener redirect_uri del query parameter o usar el default
+    redirect_uri = request.args.get('redirect_uri')
+    
+    # Si no se proporciona, intentar construir uno basado en el host actual
+    if not redirect_uri:
+        # Usar variable de entorno o construir desde request
+        redirect_uri = os.getenv('GMAIL_OAUTH_REDIRECT_URI')
+        if not redirect_uri:
+            # Construir basándose en el request actual
+            host = request.host_url.rstrip('/')
+            redirect_uri = f"{host}/auth/gmail/callback"
+    
+    print(f"[GMAIL-AUTH] Redirect URI: {redirect_uri}")
+    sys.stdout.flush()
+    
+    auth_url, state, error = emailSend.get_authorization_url(
+        redirect_uri=redirect_uri
+    )
+    
+    if error:
+        print(f"[GMAIL-AUTH] Error: {error}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': error
+        }), 400
+    
+    print(f"[GMAIL-AUTH] Authorization URL generated")
+    print("=" * 50)
+    sys.stdout.flush()
+    
+    return jsonify({
+        'success': True,
+        'authorization_url': auth_url,
+        'state': state,
+        'redirect_uri': redirect_uri,
+        'instructions': 'Visita la authorization_url en tu navegador, autoriza la aplicación, y serás redirigido al callback con un código.'
+    }), 200
+
+
+@app.route('/auth/gmail/callback', methods=['GET', 'POST'])
+def gmail_auth_callback():
+    """
+    Callback para recibir el código de autorización de Google.
+    Puede recibir el código como query parameter (GET) o en el body (POST).
+    
+    GET Query Parameters:
+        - code: Código de autorización de Google
+        - state: Estado para verificar (opcional)
+        - error: Error si el usuario rechazó (opcional)
+    
+    POST Body (JSON):
+        {
+            "code": "código de autorización",
+            "redirect_uri": "URI usada en la autorización"
+        }
+    
+    Returns:
+        JSON con el resultado:
+        {
+            "success": true,
+            "email": "usuario@gmail.com",
+            "message": "Gmail authorization successful"
+        }
+    """
+    print("=" * 50)
+    print("[GMAIL-AUTH] Callback received")
+    print(f"[GMAIL-AUTH] Method: {request.method}")
+    sys.stdout.flush()
+    
+    code = None
+    redirect_uri = None
+    
+    if request.method == 'GET':
+        # Verificar si hay error
+        error = request.args.get('error')
+        if error:
+            error_description = request.args.get('error_description', 'User denied access')
+            print(f"[GMAIL-AUTH] Authorization denied: {error} - {error_description}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': error,
+                'message': error_description
+            }), 400
+        
+        code = request.args.get('code')
+        # Reconstruir redirect_uri
+        host = request.host_url.rstrip('/')
+        redirect_uri = os.getenv('GMAIL_OAUTH_REDIRECT_URI', f"{host}/auth/gmail/callback")
+        
+    elif request.method == 'POST':
+        if not request.is_json:
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON'
+            }), 400
+        
+        data = request.get_json()
+        code = data.get('code')
+        redirect_uri = data.get('redirect_uri')
+        
+        if not redirect_uri:
+            host = request.host_url.rstrip('/')
+            redirect_uri = os.getenv('GMAIL_OAUTH_REDIRECT_URI', f"{host}/auth/gmail/callback")
+    
+    if not code:
+        print("[GMAIL-AUTH] Error: No authorization code provided")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': 'No authorization code provided',
+            'message': 'The "code" parameter is required'
+        }), 400
+    
+    print(f"[GMAIL-AUTH] Exchanging code for token...")
+    print(f"[GMAIL-AUTH] Redirect URI: {redirect_uri}")
+    sys.stdout.flush()
+    
+    success, result = emailSend.exchange_code_for_token(
+        code=code,
+        redirect_uri=redirect_uri
+    )
+    
+    if success:
+        print(f"[GMAIL-AUTH] Authorization successful for: {result.get('email')}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': True,
+            'email': result.get('email'),
+            'message': 'Gmail authorization successful! You can now send emails.'
+        }), 200
+    else:
+        print(f"[GMAIL-AUTH] Authorization failed: {result.get('error')}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': result.get('error')
+        }), 400
+
+
+# ============================================================================
+# ENDPOINTS DE ENVÍO DE EMAIL
+# ============================================================================
+
+@app.route('/send-email/factura', methods=['POST'])
+def send_email_factura_endpoint():
+    """
+    Endpoint específico para enviar correos de facturas.
+    Busca el correo del destinatario usando el valor de "Tienda" en el Google Sheet.
+    
+    IMPORTANTE: Requiere autorización previa via /auth/gmail
+    
+    Request Body (JSON):
+    {
+        "Numero_Factura": "FAC-001",
+        "Tienda": "Tienda Centro",
+        "Area": "Zona Norte",
+        "PDF_View": "https://link-al-pdf.com/factura.pdf",
+        "subject": "Factura {Numero_Factura} - {Tienda}",  // Opcional, tiene default
+        "body_text": "...",  // Opcional, tiene default
+        "body_html": "..."   // Opcional
+    }
+    
+    Variables de entorno requeridas en .env:
+        - EMAIL_SPREADSHEET_ID: ID del Google Sheet con los contactos
+        - EMAIL_WORKSHEET_NAME: Nombre de la hoja (default: Sheet1)
+        - EMAIL_SEARCH_COLUMN: Columna para buscar (default: Tienda)
+        - EMAIL_EMAIL_COLUMN: Columna con el correo (default: Email)
+    
+    Returns:
+        JSON con el resultado del envío
+    """
+    print("=" * 50)
+    print("[SEND-EMAIL-FACTURA] Endpoint called")
+    print(f"[SEND-EMAIL-FACTURA] Method: {request.method}")
+    print(f"[SEND-EMAIL-FACTURA] Content-Type: {request.content_type}")
+    sys.stdout.flush()
+    
+    try:
+        # Verificar que se envió JSON
+        if not request.is_json:
+            print("[SEND-EMAIL-FACTURA] Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+        
+        data = request.get_json()
+        
+        # Validar campos requeridos para factura
+        required_fields = ['Numero_Factura', 'Tienda', 'Area', 'PDF_View']
+        missing_fields = [field for field in required_fields if not data.get(field)]
+        
+        if missing_fields:
+            print(f"[SEND-EMAIL-FACTURA] Error: Missing required fields: {missing_fields}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing_fields,
+                'message': f'Please provide: {", ".join(missing_fields)}'
+            }), 400
+        
+        # Extraer datos de la factura
+        numero_factura = data['Numero_Factura']
+        tienda = data['Tienda']
+        area = data['Area']
+        pdf_view = data['PDF_View']
+        
+        # Obtener configuración del Sheet
+        spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
+        worksheet_name = data.get('worksheet_name', EMAIL_WORKSHEET_NAME)
+        search_column = 'Tienda'  # Columna fija para buscar
+        email_column = 'Correo Electrónico'    # Columna fija con el correo
+        
+        if not spreadsheet_id:
+            print("[SEND-EMAIL-FACTURA] Error: No spreadsheet_id configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id configured',
+                'message': 'Please set EMAIL_SPREADSHEET_ID in .env or provide spreadsheet_id in request'
+            }), 400
+        
+        # Subject y body con valores por defecto
+        default_subject = f"Factura {numero_factura} - {tienda}"
+        default_body_text = f"""
+Estimado(a),
+
+Se adjunta la información de la factura:
+
+Número de Factura: {numero_factura}
+Tienda: {tienda}
+Área: {area}
+
+Ver PDF: {pdf_view}
+
+Saludos cordiales.
+"""
+        
+        default_body_html = f"""
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6;">
+    <p>Estimado(a),</p>
+    
+    <p>Se adjunta la información de la factura:</p>
+    
+    <table style="border-collapse: collapse; margin: 20px 0;">
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>Número de Factura</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{numero_factura}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>Tienda</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{tienda}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>Área</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{area}</td>
+        </tr>
+    </table>
+    
+    <p><a href="{pdf_view}" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Ver PDF de la Factura</a></p>
+    
+    <p>Saludos cordiales.</p>
+</body>
+</html>
+"""
+        
+        subject = data.get('subject', default_subject)
+        body_text = data.get('body_text', default_body_text)
+        body_html = data.get('body_html', default_body_html)
+        
+        # Obtener credenciales OAuth2 para Gmail
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+        
+        if gmail_error or not gmail_creds:
+            print(f"[SEND-EMAIL-FACTURA] Error: Gmail not authorized - {gmail_error}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+        
+        # Obtener credenciales de Service Account para Sheets
+        sheets_credentials, project_id = get_credentials()
+        
+        # Obtener sender
+        sender = data.get('sender', os.getenv('EMAIL_SENDER', ''))
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+        
+        print(f"[SEND-EMAIL-FACTURA] Numero Factura: {numero_factura}")
+        print(f"[SEND-EMAIL-FACTURA] Tienda: {tienda}")
+        print(f"[SEND-EMAIL-FACTURA] Area: {area}")
+        print(f"[SEND-EMAIL-FACTURA] PDF View: {pdf_view}")
+        print(f"[SEND-EMAIL-FACTURA] Spreadsheet: {spreadsheet_id}")
+        print(f"[SEND-EMAIL-FACTURA] Search: {search_column} = '{tienda}'")
+        print(f"[SEND-EMAIL-FACTURA] Sender: {sender}")
+        sys.stdout.flush()
+        
+        # Variables de plantilla para reemplazar en subject/body
+        template_variables = {
+            'Numero_Factura': numero_factura,
+            'Tienda': tienda,
+            'Area': area,
+            'PDF_View': pdf_view
+        }
+        
+        # Enviar correo con búsqueda en Sheet
+        success, result = emailSend.send_email_with_sheet_lookup(
+            credentials=gmail_creds,
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            search_column=search_column,
+            search_value=tienda,  # Buscar por Tienda
+            email_column=email_column,
+            sender=sender,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            cc=data.get('cc'),
+            bcc=data.get('bcc'),
+            template_variables=template_variables,
+            sheets_credentials=sheets_credentials
+        )
+        
+        if success:
+            print(f"[SEND-EMAIL-FACTURA] Email sent successfully to: {result.get('recipient_email')}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': True,
+                'message': f"Email sent successfully to {result.get('recipient_email')}",
+                'data': {
+                    **result,
+                    'factura': {
+                        'numero': numero_factura,
+                        'tienda': tienda,
+                        'area': area,
+                        'pdf_view': pdf_view
+                    }
+                }
+            }), 200
+        else:
+            print(f"[SEND-EMAIL-FACTURA] Failed to send email: {result.get('error')}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': result.get('error', 'Unknown error'),
+                'data': result
+            }), 400
+        
+    except Exception as e:
+        print(f"[SEND-EMAIL-FACTURA] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/send-email', methods=['POST'])
+def send_email_endpoint():
+    """
+    Endpoint para enviar correos electrónicos usando Gmail OAuth2.
+    Busca el correo del destinatario en un Google Sheet y envía el email.
+    
+    IMPORTANTE: Requiere autorización previa via /auth/gmail
+    
+    Request Body (JSON):
+    {
+        "spreadsheet_id": "ID del Google Sheets con la información de contactos",
+        "worksheet_name": "Nombre de la hoja (default: 'Sheet1')",
+        "search_column": "Nombre de la columna donde buscar (ej: 'Proveedor', 'Tienda')",
+        "search_value": "Valor a buscar en esa columna",
+        "email_column": "Nombre de la columna que contiene el correo (ej: 'Email', 'Correo')",
+        "sender": "Correo del remitente (opcional, usa el correo autorizado)",
+        "subject": "Asunto del correo (puede contener {variables} de la fila)",
+        "body_text": "Cuerpo del correo en texto plano (puede contener {variables})",
+        "body_html": "Cuerpo del correo en HTML (opcional)",
+        "cc": ["lista", "de", "correos", "en", "copia"],
+        "bcc": ["lista", "de", "correos", "en", "copia", "oculta"],
+        "template_variables": {"variable": "valor"}
+    }
+    
+    Returns:
+        JSON con el resultado del envío
+    """
+    print("=" * 50)
+    print("[SEND-EMAIL] Endpoint called")
+    print(f"[SEND-EMAIL] Method: {request.method}")
+    print(f"[SEND-EMAIL] Content-Type: {request.content_type}")
+    sys.stdout.flush()
+    
+    try:
+        # Verificar que se envió JSON
+        if not request.is_json:
+            print("[SEND-EMAIL] Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+        
+        data = request.get_json()
+        
+        # Obtener spreadsheet_id y worksheet del request o de variables de entorno
+        spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
+        worksheet_name = data.get('worksheet_name', EMAIL_WORKSHEET_NAME)
+        worksheet_gid = data.get('worksheet_gid', EMAIL_WORKSHEET_GID)
+        
+        # Validar que tengamos spreadsheet_id (del request o del .env)
+        if not spreadsheet_id:
+            print("[SEND-EMAIL] Error: No spreadsheet_id provided")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id provided',
+                'message': 'Please provide spreadsheet_id in the request or set EMAIL_SPREADSHEET_ID in .env'
+            }), 400
+        
+        # Validar campos requeridos (spreadsheet_id ya no es requerido si está en .env)
+        required_fields = ['search_column', 'search_value', 'email_column', 'subject', 'body_text']
+        missing_fields = [field for field in required_fields if not data.get(field)]
+        
+        if missing_fields:
+            print(f"[SEND-EMAIL] Error: Missing required fields: {missing_fields}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing_fields,
+                'message': f'Please provide: {", ".join(missing_fields)}'
+            }), 400
+        
+        # Obtener credenciales OAuth2 para Gmail
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+        
+        if gmail_error or not gmail_creds:
+            print(f"[SEND-EMAIL] Error: Gmail not authorized - {gmail_error}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+        
+        # Obtener credenciales de Service Account para Sheets
+        sheets_credentials, project_id = get_credentials()
+        search_column = data['search_column']
+        search_value = data['search_value']
+        email_column = data['email_column']
+        sender = data.get('sender', os.getenv('EMAIL_SENDER', ''))
+        subject = data['subject']
+        body_text = data['body_text']
+        body_html = data.get('body_html')
+        cc = data.get('cc', [])
+        bcc = data.get('bcc', [])
+        template_variables = data.get('template_variables', {})
+        
+        # Si no hay sender, usar el email del usuario autorizado
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+        
+        if not sender:
+            print("[SEND-EMAIL] Error: No sender email")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No sender email',
+                'message': 'Could not determine sender email'
+            }), 400
+        
+        print(f"[SEND-EMAIL] Spreadsheet: {spreadsheet_id}")
+        print(f"[SEND-EMAIL] Worksheet: {worksheet_name}")
+        print(f"[SEND-EMAIL] Search: {search_column} = '{search_value}'")
+        print(f"[SEND-EMAIL] Email column: {email_column}")
+        print(f"[SEND-EMAIL] Sender: {sender}")
+        print(f"[SEND-EMAIL] Subject: {subject}")
+        sys.stdout.flush()
+        
+        # Enviar correo con búsqueda en Sheet
+        success, result = emailSend.send_email_with_sheet_lookup(
+            credentials=gmail_creds,  # Credenciales OAuth2 para Gmail
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            search_column=search_column,
+            search_value=search_value,
+            email_column=email_column,
+            sender=sender,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            cc=cc if cc else None,
+            bcc=bcc if bcc else None,
+            template_variables=template_variables,
+            sheets_credentials=sheets_credentials  # Service Account para Sheets
+        )
+        
+        if success:
+            print(f"[SEND-EMAIL] Email sent successfully to: {result.get('recipient_email')}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': True,
+                'message': f"Email sent successfully to {result.get('recipient_email')}",
+                'data': result
+            }), 200
+        else:
+            print(f"[SEND-EMAIL] Failed to send email: {result.get('error')}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': result.get('error', 'Unknown error'),
+                'data': result
+            }), 400
+        
+    except Exception as e:
+        print(f"[SEND-EMAIL] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/send-email/bulk', methods=['POST'])
+def send_bulk_email_endpoint():
+    """
+    Endpoint para enviar correos masivos usando Gmail OAuth2.
+    
+    IMPORTANTE: Requiere autorización previa via /auth/gmail
+    
+    Request Body (JSON):
+    {
+        "spreadsheet_id": "ID del Google Sheets",
+        "worksheet_name": "Nombre de la hoja (default: 'Sheet1')",
+        "email_column": "Columna con los correos",
+        "sender": "Correo del remitente (opcional)",
+        "subject": "Asunto (puede contener {variables})",
+        "body_text": "Cuerpo en texto (puede contener {variables})",
+        "body_html": "Cuerpo en HTML (opcional)",
+        "filter_criteria": {"columna": "valor"}
+    }
+    
+    Returns:
+        JSON con resumen del envío masivo
+    """
+    print("=" * 50)
+    print("[SEND-EMAIL-BULK] Endpoint called")
+    print(f"[SEND-EMAIL-BULK] Method: {request.method}")
+    sys.stdout.flush()
+    
+    try:
+        if not request.is_json:
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON'
+            }), 400
+        
+        data = request.get_json()
+        
+        # Obtener spreadsheet_id y worksheet del request o de variables de entorno
+        spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
+        worksheet_name = data.get('worksheet_name', EMAIL_WORKSHEET_NAME)
+        
+        # Validar que tengamos spreadsheet_id
+        if not spreadsheet_id:
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id provided',
+                'message': 'Please provide spreadsheet_id in the request or set EMAIL_SPREADSHEET_ID in .env'
+            }), 400
+        
+        # Validar campos requeridos (spreadsheet_id ya no es requerido si está en .env)
+        required_fields = ['email_column', 'subject', 'body_text']
+        missing_fields = [field for field in required_fields if not data.get(field)]
+        
+        if missing_fields:
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing_fields
+            }), 400
+        
+        # Obtener credenciales OAuth2 para Gmail
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+        
+        if gmail_error or not gmail_creds:
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+        
+        # Obtener credenciales de Service Account para Sheets
+        sheets_credentials, project_id = get_credentials()
+        
+        sender = data.get('sender', os.getenv('EMAIL_SENDER', ''))
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+        
+        if not sender:
+            return jsonify({
+                'success': False,
+                'error': 'No sender email'
+            }), 400
+        
+        results = emailSend.send_bulk_emails(
+            credentials=gmail_creds,
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            email_column=data['email_column'],
+            sender=sender,
+            subject=data['subject'],
+            body_text=data['body_text'],
+            body_html=data.get('body_html'),
+            filter_criteria=data.get('filter_criteria'),
+            sheets_credentials=sheets_credentials
+        )
+        
+        print(f"[SEND-EMAIL-BULK] Completed: {results.get('sent', 0)} sent, {results.get('failed', 0)} failed")
+        print("=" * 50)
+        sys.stdout.flush()
+        
+        success = results.get('error') is None and results.get('sent', 0) > 0
+        status_code = 200 if success else 400
+        
+        return jsonify({
+            'success': success,
+            'message': f"Sent {results.get('sent', 0)} of {results.get('total', 0)} emails",
+            'data': results
+        }), status_code
+        
+    except Exception as e:
+        print(f"[SEND-EMAIL-BULK] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/search-email', methods=['POST'])
+def search_email_endpoint():
+    """
+    Endpoint para buscar un correo en Google Sheets sin enviarlo.
+    Útil para verificar que la búsqueda funciona antes de enviar.
+    
+    Request Body (JSON):
+    {
+        "spreadsheet_id": "ID del Google Sheets",
+        "worksheet_name": "Nombre de la hoja (default: 'Sheet1')",
+        "search_column": "Columna donde buscar",
+        "search_value": "Valor a buscar",
+        "email_column": "Columna con el correo",
+        "additional_columns": ["columna1", "columna2"]
+    }
+    
+    Returns:
+        JSON con el correo encontrado y datos adicionales
+    """
+    print("=" * 50)
+    print("[SEARCH-EMAIL] Endpoint called")
+    sys.stdout.flush()
+    
+    try:
+        if not request.is_json:
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON'
+            }), 400
+        
+        data = request.get_json()
+        
+        # Obtener spreadsheet_id y worksheet del request o de variables de entorno
+        spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
+        worksheet_name = data.get('worksheet_name', EMAIL_WORKSHEET_NAME)
+        
+        # Validar que tengamos spreadsheet_id
+        if not spreadsheet_id:
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id provided',
+                'message': 'Please provide spreadsheet_id in the request or set EMAIL_SPREADSHEET_ID in .env'
+            }), 400
+        
+        required_fields = ['search_column', 'search_value', 'email_column']
+        missing_fields = [field for field in required_fields if not data.get(field)]
+        
+        if missing_fields:
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing_fields
+            }), 400
+        
+        # Usar Service Account para leer Sheets
+        credentials, project_id = get_credentials()
+        
+        email, row_data = emailSend.search_email_in_sheet(
+            credentials=credentials,
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            search_column=data['search_column'],
+            search_value=data['search_value'],
+            email_column=data['email_column'],
+            additional_columns=data.get('additional_columns')
+        )
+        
+        print(f"[SEARCH-EMAIL] Result: {email}")
+        print("=" * 50)
+        sys.stdout.flush()
+        
+        if email:
+            return jsonify({
+                'success': True,
+                'message': 'Email found',
+                'data': {
+                    'email': email,
+                    'search_column': data['search_column'],
+                    'search_value': data['search_value'],
+                    'additional_data': row_data
+                }
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'No email found for the given criteria',
+                'data': {
+                    'search_column': data['search_column'],
+                    'search_value': data['search_value']
+                }
+            }), 404
+        
+    except Exception as e:
+        print(f"[SEARCH-EMAIL] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 if __name__ == '__main__':

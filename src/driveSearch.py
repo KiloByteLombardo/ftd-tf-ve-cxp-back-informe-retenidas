@@ -152,9 +152,9 @@ class DriveSearcher:
             sys.stdout.flush()
             return None
     
-    def search_file_in_folder(self, drive_service, folder_id: str, search_term: str) -> Optional[str]:
+    def search_file_in_folder(self, drive_service, folder_id: str, search_term: str) -> List[Dict[str, str]]:
         """
-        Busca un archivo en una carpeta normal de Google Drive por nombre.
+        Busca TODOS los archivos en una carpeta normal de Google Drive por nombre.
         
         Args:
             drive_service: Instancia del servicio de Drive
@@ -162,11 +162,11 @@ class DriveSearcher:
             search_term: Término de búsqueda (número de OC)
             
         Returns:
-            str: ID del archivo encontrado, o None si no se encuentra
+            List[Dict]: Lista de archivos encontrados [{id, name, mimeType}, ...]
         """
         if not drive_service:
             print(f"[DRIVE_SEARCH] ERROR: No drive_service for folder search")
-            return None
+            return []
             
         try:
             search_term_escaped = search_term.replace("'", "\\'")
@@ -177,7 +177,7 @@ class DriveSearcher:
             results = drive_service.files().list(
                 q=query,
                 fields="files(id, name, mimeType)",
-                pageSize=10,
+                pageSize=50,  # Aumentado para obtener más resultados
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True
             ).execute()
@@ -187,30 +187,30 @@ class DriveSearcher:
             items = results.get('files', [])
             
             if items:
-                file_id = items[0]['id']
-                file_name = items[0]['name']
-                print(f"[DRIVE_SEARCH] FOUND in folder {folder_id[:15]}...: {file_name} ({elapsed_time:.2f}s)")
+                print(f"[DRIVE_SEARCH] FOUND {len(items)} files in folder {folder_id[:15]}... ({elapsed_time:.2f}s)")
+                for item in items:
+                    print(f"[DRIVE_SEARCH]   - {item['name']}")
                 sys.stdout.flush()
-                return file_id
+                return items
             
-            return None
+            return []
             
         except HttpError as error:
             error_code = error.resp.status if hasattr(error, 'resp') else 'unknown'
             error_reason = error._get_reason() if hasattr(error, '_get_reason') else str(error)
             print(f"[DRIVE_SEARCH] HTTP Error {error_code} in folder {folder_id[:15]}... for '{search_term}': {error_reason}")
             sys.stdout.flush()
-            return None
+            return []
         except Exception as e:
             print(f"[DRIVE_SEARCH] ERROR in folder {folder_id[:15]}... for '{search_term}': {str(e)}")
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
-            return None
+            return []
     
-    def search_file_in_shared_drive(self, drive_service, shared_drive_id: str, search_term: str) -> Optional[str]:
+    def search_file_in_shared_drive(self, drive_service, shared_drive_id: str, search_term: str) -> List[Dict[str, str]]:
         """
-        Busca un archivo en una Unidad Compartida (Shared Drive) por contenido OCR del PDF y por nombre.
+        Busca TODOS los archivos en una Unidad Compartida (Shared Drive) por contenido OCR del PDF y por nombre.
         
         Args:
             drive_service: Instancia del servicio de Drive
@@ -218,11 +218,11 @@ class DriveSearcher:
             search_term: Término de búsqueda (número de OC)
             
         Returns:
-            str: ID del archivo encontrado, o None si no se encuentra
+            List[Dict]: Lista de archivos encontrados [{id, name, webViewLink}, ...]
         """
         if not drive_service:
             print(f"[DRIVE_SEARCH] ERROR: No drive_service for shared drive search")
-            return None
+            return []
             
         try:
             start_time = time.time()
@@ -240,7 +240,7 @@ class DriveSearcher:
                     driveId=shared_drive_id,
                     q=query_fulltext,
                     pageSize=50,
-                    fields="files(id, name, webViewLink, parents)",
+                    fields="files(id, name, webViewLink, parents, mimeType)",
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True
                 ).execute()
@@ -264,7 +264,7 @@ class DriveSearcher:
                     driveId=shared_drive_id,
                     q=query_name,
                     pageSize=50,
-                    fields="files(id, name, webViewLink, parents)",
+                    fields="files(id, name, webViewLink, parents, mimeType)",
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True
                 ).execute()
@@ -282,26 +282,26 @@ class DriveSearcher:
             elapsed_time = time.time() - start_time
             
             if all_items:
-                file_id = all_items[0]['id']
-                file_name = all_items[0]['name']
-                print(f"[DRIVE_SEARCH] FOUND in Shared Drive {shared_drive_id[:15]}...: {file_name} ({elapsed_time:.2f}s, {len(all_items)} results)")
+                print(f"[DRIVE_SEARCH] FOUND {len(all_items)} files in Shared Drive {shared_drive_id[:15]}... ({elapsed_time:.2f}s)")
+                for item in all_items:
+                    print(f"[DRIVE_SEARCH]   - {item['name']}")
                 sys.stdout.flush()
-                return file_id
+                return all_items
             
-            return None
+            return []
             
         except HttpError as error:
             error_code = error.resp.status if hasattr(error, 'resp') else 'unknown'
             error_reason = error._get_reason() if hasattr(error, '_get_reason') else str(error)
             print(f"[DRIVE_SEARCH] HTTP Error {error_code} in Shared Drive {shared_drive_id[:15]}... for '{search_term}': {error_reason}")
             sys.stdout.flush()
-            return None
+            return []
         except Exception as e:
             print(f"[DRIVE_SEARCH] ERROR in Shared Drive {shared_drive_id[:15]}... for '{search_term}': {str(e)}")
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
-            return None
+            return []
     
     def search_in_superapp(self, orden_compra: str, verbose: bool = False) -> Optional[str]:
         """
@@ -380,7 +380,8 @@ class DriveSearcher:
     
     def search_for_order(self, drive_service, orden_compra: str) -> Dict[str, Any]:
         """
-        Busca archivos para una orden de compra en todas las fuentes.
+        Busca TODOS los archivos para una orden de compra en todas las fuentes.
+        Acumula todos los PDFs encontrados en cada carpeta.
         
         Args:
             drive_service: Instancia del servicio de Drive
@@ -392,10 +393,11 @@ class DriveSearcher:
         links_data = {
             "orden_compra": orden_compra,
             "drive_files": [],
-            "invoice_pdf": None
+            "invoice_pdf": None,
+            "total_files_found": 0
         }
         
-        # Buscar en TODAS las carpetas de Drive
+        # Buscar en TODAS las carpetas de Drive y guardar TODOS los archivos
         for folder_idx, folder_id in enumerate(self.folders):
             if not folder_id or folder_id.strip() == '':
                 continue
@@ -405,22 +407,31 @@ class DriveSearcher:
                 is_shared_drive = self.shared_drive_flags[folder_idx] if folder_idx < len(self.shared_drive_flags) else False
                 
                 if is_shared_drive:
-                    file_id = self.search_file_in_shared_drive(drive_service, folder_id.strip(), orden_compra)
+                    files_found = self.search_file_in_shared_drive(drive_service, folder_id.strip(), orden_compra)
                 else:
-                    file_id = self.search_file_in_folder(drive_service, folder_id.strip(), orden_compra)
+                    files_found = self.search_file_in_folder(drive_service, folder_id.strip(), orden_compra)
                 
-                if file_id:
-                    preview_link = f"https://drive.google.com/file/d/{file_id}/preview"
-                    links_data["drive_files"].append({
-                        "file_id": file_id,
-                        "preview_link": preview_link,
-                        "folder_number": folder_idx + 1,
-                        "source": "shared_drive" if is_shared_drive else "folder"
-                    })
+                # Agregar TODOS los archivos encontrados en esta carpeta
+                for file_item in files_found:
+                    file_id = file_item.get('id')
+                    file_name = file_item.get('name', 'Unknown')
+                    if file_id:
+                        preview_link = f"https://drive.google.com/file/d/{file_id}/preview"
+                        links_data["drive_files"].append({
+                            "file_id": file_id,
+                            "file_name": file_name,
+                            "preview_link": preview_link,
+                            "folder_number": folder_idx + 1,
+                            "source": "shared_drive" if is_shared_drive else "folder"
+                        })
+                        
             except Exception as e:
                 print(f"[DRIVE_SEARCH] Error searching folder {folder_idx + 1} for OC '{orden_compra}': {str(e)}")
                 sys.stdout.flush()
                 continue
+        
+        # Actualizar el total de archivos encontrados
+        links_data["total_files_found"] = len(links_data["drive_files"])
         
         # Buscar en el endpoint de SuperApp (si está configurado)
         if self.superapp_url and self.superapp_api_key:
@@ -562,22 +573,26 @@ class DriveSearcher:
                         results_dict[idx] = '{}'
         
         # Calcular estadísticas detalladas
-        drive_count = 0
+        orders_with_drive = 0
+        total_drive_files = 0
         superapp_count = 0
         for json_str in results_dict.values():
             if json_str != '{}':
                 try:
                     data = json.loads(json_str)
-                    if data.get('drive_files'):
-                        drive_count += 1
+                    drive_files = data.get('drive_files', [])
+                    if drive_files:
+                        orders_with_drive += 1
+                        total_drive_files += len(drive_files)
                     if data.get('invoice_pdf'):
                         superapp_count += 1
                 except:
                     pass
         
         print(f"[DRIVE_SEARCH] ========================================")
-        print(f"[DRIVE_SEARCH] COMPLETED: {matched_count}/{total_rows} files found total")
-        print(f"[DRIVE_SEARCH]   - From Drive folders: {drive_count}")
+        print(f"[DRIVE_SEARCH] COMPLETED: {matched_count}/{total_rows} orders with files found")
+        print(f"[DRIVE_SEARCH]   - Orders with Drive files: {orders_with_drive}")
+        print(f"[DRIVE_SEARCH]   - Total Drive files found: {total_drive_files}")
         print(f"[DRIVE_SEARCH]   - From SuperApp API: {superapp_count}")
         print(f"[DRIVE_SEARCH] ========================================")
         sys.stdout.flush()

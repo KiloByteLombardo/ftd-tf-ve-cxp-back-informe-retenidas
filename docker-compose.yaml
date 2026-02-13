@@ -24,6 +24,11 @@ services:
       # - EMAIL_SPREADSHEET_ID=your-spreadsheet-id
       # - EMAIL_WORKSHEET_NAME=Sheet1
       # - EMAIL_WORKSHEET_GID=0
+      # REIM Bot OC configuration (can be overridden by .env file)
+      # - REIM_TRIGGER_URL=https://bot-oc-reim-736936631238.us-central1.run.app/test/single
+      # - REIM_RESULTS_URL=https://bot-oc-reim-736936631238.us-central1.run.app/results
+      # - REIM_POLL_INTERVAL=120
+      # - REIM_MAX_RETRIES=15
     env_file:
       - .env
     restart: unless-stopped

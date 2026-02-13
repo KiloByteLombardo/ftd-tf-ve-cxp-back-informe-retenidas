@@ -1,5 +1,7 @@
 import os
 import sys
+import threading
+import time
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from google.auth import default, load_credentials_from_file
@@ -40,6 +42,15 @@ TABLE_ID = os.getenv("GRIST_TABLE_ID")
 EMAIL_SPREADSHEET_ID = os.getenv("EMAIL_SPREADSHEET_ID")
 EMAIL_WORKSHEET_NAME = os.getenv("EMAIL_WORKSHEET_NAME", "Sheet1")
 EMAIL_WORKSHEET_GID = os.getenv("EMAIL_WORKSHEET_GID")  # GID numérico de la hoja (opcional)
+
+# Configuración de REIM (Bot OC)
+REIM_TRIGGER_URL = os.getenv("REIM_TRIGGER_URL")
+REIM_RESULTS_URL = os.getenv("REIM_RESULTS_URL")
+REIM_POLL_INTERVAL = int(os.getenv("REIM_POLL_INTERVAL", "120"))
+REIM_MAX_RETRIES = int(os.getenv("REIM_MAX_RETRIES", "15"))
+
+# Tabla de Grist para resultados REIM
+GRIST_REIM_TABLE_ID = os.getenv("GRIST_REIM_TABLE_ID", "Liberar_Unidades")
 
 def get_credentials():
     """
@@ -2037,6 +2048,662 @@ def search_email_endpoint():
         return jsonify({
             'success': False,
             'error': str(e)
+        }), 500
+
+
+def _reim_poll_and_send_email(
+    execution_id: str,
+    order_id: str,
+    recipient_email: str,
+    tienda: str,
+    gmail_creds,
+    sender: str
+):
+    """
+    Función que corre en un hilo en background.
+    Hace polling al endpoint de resultados REIM cada REIM_POLL_INTERVAL segundos,
+    hasta un máximo de REIM_MAX_RETRIES intentos.
+    Cuando obtiene resultados exitosos, envía el correo formateado.
+    """
+    log_prefix = f"[REIM-BG][OC:{order_id}][exec:{execution_id[:8]}]"
+    print(f"{log_prefix} Background thread started. Polling every {REIM_POLL_INTERVAL}s, max {REIM_MAX_RETRIES} retries.")
+    sys.stdout.flush()
+
+    results_url = f"{REIM_RESULTS_URL}/{execution_id}"
+    params = {"mode": "quantity_variance"}
+
+    for attempt in range(1, REIM_MAX_RETRIES + 1):
+        try:
+            print(f"{log_prefix} Poll attempt {attempt}/{REIM_MAX_RETRIES} - waiting {REIM_POLL_INTERVAL}s...")
+            sys.stdout.flush()
+            time.sleep(REIM_POLL_INTERVAL)
+
+            print(f"{log_prefix} Calling GET {results_url}")
+            sys.stdout.flush()
+            resp = requests.get(results_url, params=params, timeout=60)
+
+            if resp.status_code != 200:
+                print(f"{log_prefix} HTTP {resp.status_code} - result not ready yet.")
+                sys.stdout.flush()
+                continue
+
+            data = resp.json()
+            status = data.get("status", "")
+            total = data.get("total", 0)
+
+            if status == "success" and total > 0:
+                print(f"{log_prefix} Results received! total={total}")
+                sys.stdout.flush()
+                results = data.get("results", [])
+
+                # --- Construir plantilla de correo ---
+                items_text_lines = []
+                items_html_rows = []
+
+                for item in results:
+                    desc = item.get("item_description", "N/A")
+                    variance = item.get("qty_variance", 0)
+                    variance_int = int(variance) if variance == int(variance) else variance
+                    items_text_lines.append(f"  - {desc} ({variance_int} UNIDADES)")
+                    items_html_rows.append(f"""
+                        <tr>
+                            <td style="padding: 8px; border: 1px solid #ddd;">{desc}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">{variance_int} UNIDADES</td>
+                        </tr>""")
+
+                # Tomar datos del primer resultado para campos comunes
+                first = results[0]
+                oc = first.get("order_id", order_id)
+                invoice = first.get("invoice", "N/A")
+                supplier = first.get("supplier", "N/A")
+                verification_date_raw = first.get("verification_date", "N/A")
+
+                # Formatear fecha: "2026-02-11T16:41:40" -> "11-02-2026"
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(verification_date_raw)
+                    verification_date = dt.strftime("%d-%m-%Y")
+                except (ValueError, TypeError):
+                    verification_date = verification_date_raw
+
+                items_text = "\n".join(items_text_lines)
+
+                subject = f"Discrepancia en unidades - OC {oc} - {tienda}"
+
+                body_text = f"""Buenas tardes, gusto saludarles.
+
+Estimados, solicitamos su apoyo en la revisión del siguiente caso por presentar discrepancia en unidades en el/los ítem(s):
+
+{items_text}
+
+Por favor indicar si se trata de un ajuste o faltante en recepción.
+OC: {oc}
+Factura: {invoice}
+Proveedor: {supplier}
+Fecha de recepción: {verification_date}
+
+Es importante que la respuesta sea a la brevedad posible.
+Muchas gracias,"""
+
+                items_html_all = "".join(items_html_rows)
+
+                body_html = f"""
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+    <p>Buenas tardes, gusto saludarles.</p>
+    
+    <p>Estimados, solicitamos su apoyo en la revisión del siguiente caso por presentar discrepancia en unidades en el/los ítem(s):</p>
+    
+    <table style="border-collapse: collapse; margin: 15px 0; width: auto;">
+        <thead>
+            <tr>
+                <th style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5; text-align: left;">Descripción del Ítem</th>
+                <th style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5; text-align: center;">Varianza</th>
+            </tr>
+        </thead>
+        <tbody>{items_html_all}
+        </tbody>
+    </table>
+    
+    <p>Por favor indicar si se trata de un ajuste o faltante en recepción.</p>
+    
+    <table style="border-collapse: collapse; margin: 15px 0;">
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>OC</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{oc}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>Factura</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{invoice}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>Proveedor</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{supplier}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; background-color: #f5f5f5;"><strong>Fecha de recepción</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{verification_date}</td>
+        </tr>
+    </table>
+    
+    <p><strong>Es importante que la respuesta sea a la brevedad posible.</strong></p>
+    <p>Muchas gracias,</p>
+</body>
+</html>"""
+
+                # --- Enviar correo ---
+                print(f"{log_prefix} Sending email to {recipient_email}...")
+                sys.stdout.flush()
+
+                success, result = emailSend.send_email(
+                    credentials=gmail_creds,
+                    sender=sender,
+                    to=recipient_email,
+                    subject=subject,
+                    body_text=body_text,
+                    body_html=body_html
+                )
+
+                if success:
+                    print(f"{log_prefix} Email sent successfully to {recipient_email}")
+                else:
+                    print(f"{log_prefix} ERROR sending email: {result.get('error', 'Unknown')}")
+                sys.stdout.flush()
+                return
+
+            else:
+                print(f"{log_prefix} status='{status}', total={total} - not ready yet.")
+                sys.stdout.flush()
+
+        except Exception as e:
+            print(f"{log_prefix} ERROR on attempt {attempt}: {str(e)}")
+            sys.stdout.flush()
+            import traceback
+            traceback.print_exc()
+
+    # Si llegamos aquí, se agotaron los reintentos
+    print(f"{log_prefix} MAX RETRIES ({REIM_MAX_RETRIES}) EXCEEDED. Giving up.")
+    sys.stdout.flush()
+
+
+@app.route('/send-email/reim', methods=['POST'])
+def send_email_reim_endpoint():
+    """
+    Endpoint para consultar REIM por varianza de cantidad y enviar correo con los resultados.
+    
+    Flujo:
+    1. Recibe order_id y Tienda
+    2. Busca el correo del destinatario en Google Sheets por Tienda
+    3. Llama al endpoint REIM trigger (form-data)
+    4. Obtiene execution_id
+    5. Lanza un hilo en background que hace polling al endpoint de resultados
+    6. Retorna inmediatamente al usuario con el execution_id
+    
+    Request Body (JSON):
+    {
+        "order_id": "38696664",
+        "Tienda": "Tienda Centro"
+    }
+    
+    Returns:
+        JSON con execution_id (respuesta inmediata)
+    """
+    print("=" * 50)
+    print("[SEND-EMAIL-REIM] Endpoint called")
+    print(f"[SEND-EMAIL-REIM] Method: {request.method}")
+    print(f"[SEND-EMAIL-REIM] Content-Type: {request.content_type}")
+    sys.stdout.flush()
+
+    try:
+        # Verificar JSON
+        if not request.is_json:
+            print("[SEND-EMAIL-REIM] Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+
+        data = request.get_json()
+
+        # Validar campos requeridos
+        order_id = data.get('order_id')
+        tienda = data.get('Tienda')
+
+        missing = []
+        if not order_id:
+            missing.append('order_id')
+        if not tienda:
+            missing.append('Tienda')
+
+        if missing:
+            print(f"[SEND-EMAIL-REIM] Error: Missing required fields: {missing}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing,
+                'message': f'Please provide: {", ".join(missing)}'
+            }), 400
+
+        # Validar configuración REIM
+        if not REIM_TRIGGER_URL or not REIM_RESULTS_URL:
+            print("[SEND-EMAIL-REIM] Error: REIM URLs not configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'REIM not configured',
+                'message': 'Please set REIM_TRIGGER_URL and REIM_RESULTS_URL in .env'
+            }), 500
+
+        # --- Paso 1: Buscar correo del destinatario en Google Sheet ---
+        print(f"[SEND-EMAIL-REIM] Looking up email for Tienda='{tienda}'...")
+        sys.stdout.flush()
+
+        spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
+        worksheet_name = data.get('worksheet_name', EMAIL_WORKSHEET_NAME)
+        search_column = 'Tienda'
+        email_column = 'Correo Electrónico'
+
+        if not spreadsheet_id:
+            print("[SEND-EMAIL-REIM] Error: No spreadsheet_id configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id configured',
+                'message': 'Please set EMAIL_SPREADSHEET_ID in .env or provide spreadsheet_id in request'
+            }), 400
+
+        sheets_credentials, project_id = get_credentials()
+        recipient_email, row_data = emailSend.search_email_in_sheet(
+            credentials=sheets_credentials,
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            search_column=search_column,
+            search_value=tienda,
+            email_column=email_column
+        )
+
+        if not recipient_email:
+            print(f"[SEND-EMAIL-REIM] Error: No email found for Tienda='{tienda}'")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': f"No email found for Tienda '{tienda}' in Google Sheet",
+                'message': 'Please check the Tienda name or update the contact sheet'
+            }), 404
+
+        print(f"[SEND-EMAIL-REIM] Found email: {recipient_email}")
+        sys.stdout.flush()
+
+        # --- Paso 2: Verificar credenciales Gmail ---
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+
+        if gmail_error or not gmail_creds:
+            print(f"[SEND-EMAIL-REIM] Error: Gmail not authorized - {gmail_error}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+
+        sender = data.get('sender', os.getenv('EMAIL_SENDER', ''))
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+
+        # --- Paso 3: Llamar al endpoint REIM trigger ---
+        print(f"[SEND-EMAIL-REIM] Calling REIM trigger for order_id={order_id}...")
+        sys.stdout.flush()
+
+        # Enviar como multipart/form-data (el endpoint REIM lo requiere)
+        form_fields = {
+            'order_id': (None, str(order_id)),
+            'mode': (None, 'quantity_variance'),
+            'email': (None, 'grist-server@farmatodo.com')
+        }
+
+        try:
+            reim_resp = requests.post(REIM_TRIGGER_URL, files=form_fields, timeout=60)
+            print(f"[SEND-EMAIL-REIM] REIM response status: {reim_resp.status_code}")
+            print(f"[SEND-EMAIL-REIM] REIM response body: {reim_resp.text}")
+            sys.stdout.flush()
+            reim_resp.raise_for_status()
+            reim_data = reim_resp.json()
+        except requests.exceptions.RequestException as e:
+            print(f"[SEND-EMAIL-REIM] Error calling REIM trigger: {str(e)}")
+            sys.stdout.flush()
+            # Intentar capturar el body de la respuesta de error
+            error_body = None
+            if hasattr(e, 'response') and e.response is not None:
+                error_body = e.response.text
+                print(f"[SEND-EMAIL-REIM] REIM error response body: {error_body}")
+                sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Failed to call REIM trigger endpoint',
+                'message': str(e),
+                'reim_response_body': error_body
+            }), 502
+
+        execution_id = reim_data.get('execution_id')
+        if not execution_id:
+            print(f"[SEND-EMAIL-REIM] Error: No execution_id in REIM response: {reim_data}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No execution_id returned by REIM',
+                'reim_response': reim_data
+            }), 502
+
+        print(f"[SEND-EMAIL-REIM] Got execution_id: {execution_id}")
+        sys.stdout.flush()
+
+        # --- Paso 4: Lanzar hilo en background ---
+        bg_thread = threading.Thread(
+            target=_reim_poll_and_send_email,
+            args=(
+                execution_id,
+                str(order_id),
+                recipient_email,
+                tienda,
+                gmail_creds,
+                sender
+            ),
+            daemon=True,
+            name=f"reim-poll-{order_id}"
+        )
+        bg_thread.start()
+
+        print(f"[SEND-EMAIL-REIM] Background thread launched: {bg_thread.name}")
+        print("=" * 50)
+        sys.stdout.flush()
+
+        # --- Paso 5: Retornar inmediatamente ---
+        return jsonify({
+            'success': True,
+            'message': f'REIM process started. Email will be sent to {recipient_email} when results are ready.',
+            'execution_id': execution_id,
+            'order_id': str(order_id),
+            'recipient_email': recipient_email,
+            'tienda': tienda,
+            'poll_interval_seconds': REIM_POLL_INTERVAL,
+            'max_retries': REIM_MAX_RETRIES
+        }), 200
+
+    except Exception as e:
+        print(f"[SEND-EMAIL-REIM] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+def _reim_poll_and_upload_grist(
+    execution_id: str,
+    order_id: str
+):
+    """
+    Función que corre en un hilo en background.
+    Hace polling al endpoint de resultados REIM cada REIM_POLL_INTERVAL segundos,
+    hasta un máximo de REIM_MAX_RETRIES intentos.
+    Cuando obtiene resultados exitosos, sube los datos a la tabla Grist (Liberar_Unidades).
+    """
+    log_prefix = f"[REIM-GRIST-BG][OC:{order_id}][exec:{execution_id[:8]}]"
+    print(f"{log_prefix} Background thread started. Polling every {REIM_POLL_INTERVAL}s, max {REIM_MAX_RETRIES} retries.")
+    sys.stdout.flush()
+
+    results_url = f"{REIM_RESULTS_URL}/{execution_id}"
+    params = {"mode": "quantity_variance"}
+
+    for attempt in range(1, REIM_MAX_RETRIES + 1):
+        try:
+            print(f"{log_prefix} Poll attempt {attempt}/{REIM_MAX_RETRIES} - waiting {REIM_POLL_INTERVAL}s...")
+            sys.stdout.flush()
+            time.sleep(REIM_POLL_INTERVAL)
+
+            print(f"{log_prefix} Calling GET {results_url}")
+            sys.stdout.flush()
+            resp = requests.get(results_url, params=params, timeout=60)
+
+            if resp.status_code != 200:
+                print(f"{log_prefix} HTTP {resp.status_code} - result not ready yet.")
+                sys.stdout.flush()
+                continue
+
+            data = resp.json()
+            status = data.get("status", "")
+            total = data.get("total", 0)
+
+            if status == "success" and total > 0:
+                print(f"{log_prefix} Results received! total={total}")
+                sys.stdout.flush()
+                results = data.get("results", [])
+
+                # --- Mapear resultados a registros de Grist ---
+                grist_records = []
+                for item in results:
+                    fields = {
+                        "order_id": item.get("order_id", ""),
+                        "invoice": item.get("invoice", ""),
+                        "item_description": item.get("item_description", ""),
+                        "invoice_qty": item.get("invoice_qty", 0),
+                        "receipt_avail_qty": item.get("receipt_avail_qty", 0),
+                        "qty_variance": item.get("qty_variance", 0),
+                        "supplier": item.get("supplier", ""),
+                        "status": item.get("status", ""),
+                        "verification_date": str(item.get("verification_date", "")),
+                        "execution_id": item.get("execution_id", "")
+                    }
+                    grist_records.append({"fields": fields})
+
+                grist_payload = {"records": grist_records}
+
+                # --- Subir a Grist ---
+                grist_url = f"{SERVER_URL}/{DOC_ID}/tables/{GRIST_REIM_TABLE_ID}/records"
+                print(f"{log_prefix} Uploading {len(grist_records)} records to Grist table '{GRIST_REIM_TABLE_ID}'...")
+                sys.stdout.flush()
+
+                try:
+                    grist_resp = requests.post(
+                        grist_url,
+                        headers=HEADERS,
+                        json=grist_payload,
+                        timeout=120
+                    )
+
+                    if grist_resp.status_code in [200, 201]:
+                        print(f"{log_prefix} Successfully uploaded {len(grist_records)} records to Grist.")
+                    else:
+                        print(f"{log_prefix} ERROR uploading to Grist: {grist_resp.status_code} - {grist_resp.text}")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"{log_prefix} ERROR calling Grist API: {str(e)}")
+                    sys.stdout.flush()
+
+                return
+
+            else:
+                print(f"{log_prefix} status='{status}', total={total} - not ready yet.")
+                sys.stdout.flush()
+
+        except Exception as e:
+            print(f"{log_prefix} ERROR on attempt {attempt}: {str(e)}")
+            sys.stdout.flush()
+            import traceback
+            traceback.print_exc()
+
+    # Si llegamos aquí, se agotaron los reintentos
+    print(f"{log_prefix} MAX RETRIES ({REIM_MAX_RETRIES}) EXCEEDED. Giving up.")
+    sys.stdout.flush()
+
+
+@app.route('/reim/grist', methods=['POST'])
+def reim_grist_endpoint():
+    """
+    Endpoint para consultar REIM por varianza de cantidad y subir los resultados
+    a la tabla Grist 'Liberar_Unidades'.
+    
+    Flujo:
+    1. Recibe order_id
+    2. Llama al endpoint REIM trigger (form-data)
+    3. Obtiene execution_id
+    4. Lanza un hilo en background que hace polling al endpoint de resultados
+    5. Cuando obtiene resultados, los sube a Grist
+    6. Retorna inmediatamente al usuario con el execution_id
+    
+    Request Body (JSON):
+    {
+        "order_id": "38696664"
+    }
+    
+    Returns:
+        JSON con execution_id (respuesta inmediata)
+    """
+    print("=" * 50)
+    print("[REIM-GRIST] Endpoint called")
+    print(f"[REIM-GRIST] Method: {request.method}")
+    print(f"[REIM-GRIST] Content-Type: {request.content_type}")
+    sys.stdout.flush()
+
+    try:
+        # Verificar JSON
+        if not request.is_json:
+            print("[REIM-GRIST] Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+
+        data = request.get_json()
+
+        # Validar campo requerido
+        order_id = data.get('order_id')
+
+        if not order_id:
+            print("[REIM-GRIST] Error: Missing required field: order_id")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Missing required field',
+                'missing_fields': ['order_id'],
+                'message': 'Please provide: order_id'
+            }), 400
+
+        # Validar configuración REIM
+        if not REIM_TRIGGER_URL or not REIM_RESULTS_URL:
+            print("[REIM-GRIST] Error: REIM URLs not configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'REIM not configured',
+                'message': 'Please set REIM_TRIGGER_URL and REIM_RESULTS_URL in .env'
+            }), 500
+
+        # Validar configuración Grist
+        if not SERVER_URL or not DOC_ID:
+            print("[REIM-GRIST] Error: Grist not configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Grist not configured',
+                'message': 'Please set GRIST_SERVER_URL and GRIST_DOC_ID in .env'
+            }), 500
+
+        # --- Paso 1: Llamar al endpoint REIM trigger ---
+        print(f"[REIM-GRIST] Calling REIM trigger for order_id={order_id}...")
+        sys.stdout.flush()
+
+        # Enviar como multipart/form-data
+        form_fields = {
+            'order_id': (None, str(order_id)),
+            'mode': (None, 'quantity_variance'),
+            'email': (None, 'grist-server@farmatodo.com')
+        }
+
+        try:
+            reim_resp = requests.post(REIM_TRIGGER_URL, files=form_fields, timeout=60)
+            print(f"[REIM-GRIST] REIM response status: {reim_resp.status_code}")
+            print(f"[REIM-GRIST] REIM response body: {reim_resp.text}")
+            sys.stdout.flush()
+            reim_resp.raise_for_status()
+            reim_data = reim_resp.json()
+        except requests.exceptions.RequestException as e:
+            print(f"[REIM-GRIST] Error calling REIM trigger: {str(e)}")
+            sys.stdout.flush()
+            error_body = None
+            if hasattr(e, 'response') and e.response is not None:
+                error_body = e.response.text
+                print(f"[REIM-GRIST] REIM error response body: {error_body}")
+                sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Failed to call REIM trigger endpoint',
+                'message': str(e),
+                'reim_response_body': error_body
+            }), 502
+
+        execution_id = reim_data.get('execution_id')
+        if not execution_id:
+            print(f"[REIM-GRIST] Error: No execution_id in REIM response: {reim_data}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No execution_id returned by REIM',
+                'reim_response': reim_data
+            }), 502
+
+        print(f"[REIM-GRIST] Got execution_id: {execution_id}")
+        sys.stdout.flush()
+
+        # --- Paso 2: Lanzar hilo en background ---
+        bg_thread = threading.Thread(
+            target=_reim_poll_and_upload_grist,
+            args=(
+                execution_id,
+                str(order_id)
+            ),
+            daemon=True,
+            name=f"reim-grist-{order_id}"
+        )
+        bg_thread.start()
+
+        print(f"[REIM-GRIST] Background thread launched: {bg_thread.name}")
+        print("=" * 50)
+        sys.stdout.flush()
+
+        # --- Paso 3: Retornar inmediatamente ---
+        return jsonify({
+            'success': True,
+            'message': f'REIM process started. Results will be uploaded to Grist table "{GRIST_REIM_TABLE_ID}" when ready.',
+            'execution_id': execution_id,
+            'order_id': str(order_id),
+            'grist_table': GRIST_REIM_TABLE_ID,
+            'poll_interval_seconds': REIM_POLL_INTERVAL,
+            'max_retries': REIM_MAX_RETRIES
+        }), 200
+
+    except Exception as e:
+        print(f"[REIM-GRIST] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
         }), 500
 
 

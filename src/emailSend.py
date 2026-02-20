@@ -11,6 +11,7 @@ import json
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email import encoders
 from typing import Optional, Dict, List, Tuple, Any
 import gspread
@@ -20,6 +21,7 @@ from google_auth_oauthlib.flow import Flow, InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.cloud import storage as gcs_storage
 
 
 # Scopes necesarios para Gmail API y Google Sheets
@@ -29,7 +31,11 @@ ALL_SCOPES = GMAIL_SCOPES + SHEETS_SCOPES
 
 # Rutas de archivos de credenciales (configurables por variables de entorno)
 CLIENT_SECRET_PATH = os.getenv('GMAIL_CLIENT_SECRET_PATH', '/app/client_secret.json')
-TOKEN_PATH = os.getenv('GMAIL_TOKEN_PATH', '/app/gmail_token.json')
+TOKEN_PATH = os.getenv('GMAIL_TOKEN_PATH', '/tmp/gmail_token.json')  # /tmp es escribible en Cloud Run
+
+# Configuración de GCS para persistencia del token
+GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME', '')
+GCS_TOKEN_BLOB_NAME = os.getenv('GCS_TOKEN_BLOB_NAME', 'Tokens/gmail_token.json')
 
 
 def get_gmail_credentials_oauth2(
@@ -55,17 +61,40 @@ def get_gmail_credentials_oauth2(
     
     creds = None
     
-    # Verificar si existe un token guardado
-    if os.path.exists(token_path):
+    # 1. Intentar cargar desde GCS (fuente principal de verdad)
+    token_json = _load_token_from_gcs()
+    if token_json:
         try:
-            # Cargar sin especificar scopes para evitar validación estricta
-            # Los scopes ya están incluidos en el token
+            token_data = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(token_data)
+            print(f"[EMAIL] Loaded credentials from GCS")
+            print(f"[EMAIL] Token scopes: {creds.scopes}")
+            sys.stdout.flush()
+            
+            # Guardar copia local como caché
+            try:
+                token_dir = os.path.dirname(token_path)
+                if token_dir and not os.path.exists(token_dir):
+                    os.makedirs(token_dir, exist_ok=True)
+                with open(token_path, 'w') as f:
+                    f.write(token_json)
+            except Exception:
+                pass  # No es crítico si falla la caché local
+                
+        except Exception as e:
+            print(f"[EMAIL] Error loading token from GCS data: {str(e)}")
+            sys.stdout.flush()
+            creds = None
+    
+    # 2. Fallback: cargar desde archivo local (caché)
+    if not creds and os.path.exists(token_path):
+        try:
             creds = Credentials.from_authorized_user_file(token_path)
-            print(f"[EMAIL] Loaded credentials from {token_path}")
+            print(f"[EMAIL] Loaded credentials from local cache: {token_path}")
             print(f"[EMAIL] Token scopes: {creds.scopes}")
             sys.stdout.flush()
         except Exception as e:
-            print(f"[EMAIL] Error loading token: {str(e)}")
+            print(f"[EMAIL] Error loading token from local cache: {str(e)}")
             sys.stdout.flush()
             creds = None
     
@@ -98,29 +127,108 @@ def get_gmail_credentials_oauth2(
     return creds, None
 
 
+def _save_token_to_gcs(token_json: str, blob_name: str = None) -> bool:
+    """
+    Guarda el token en un bucket de GCS para persistencia en Cloud Run.
+    
+    Args:
+        token_json: JSON string del token
+        blob_name: Nombre del blob en GCS
+        
+    Returns:
+        True si se guardó correctamente, False en caso contrario
+    """
+    bucket_name = GCS_BUCKET_NAME
+    blob_name = blob_name or GCS_TOKEN_BLOB_NAME
+    
+    if not bucket_name:
+        print("[EMAIL] GCS_BUCKET_NAME not configured, skipping GCS save")
+        sys.stdout.flush()
+        return False
+    
+    try:
+        client = gcs_storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(token_json, content_type='application/json')
+        print(f"[EMAIL] Token saved to GCS: gs://{bucket_name}/{blob_name}")
+        sys.stdout.flush()
+        return True
+    except Exception as e:
+        print(f"[EMAIL] Error saving token to GCS: {str(e)}")
+        sys.stdout.flush()
+        return False
+
+
+def _load_token_from_gcs(blob_name: str = None) -> Optional[str]:
+    """
+    Carga el token desde un bucket de GCS.
+    
+    Args:
+        blob_name: Nombre del blob en GCS
+        
+    Returns:
+        JSON string del token o None si no existe/falla
+    """
+    bucket_name = GCS_BUCKET_NAME
+    blob_name = blob_name or GCS_TOKEN_BLOB_NAME
+    
+    if not bucket_name:
+        print("[EMAIL] GCS_BUCKET_NAME not configured, skipping GCS load")
+        sys.stdout.flush()
+        return None
+    
+    try:
+        client = gcs_storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        
+        if not blob.exists():
+            print(f"[EMAIL] Token not found in GCS: gs://{bucket_name}/{blob_name}")
+            sys.stdout.flush()
+            return None
+        
+        token_json = blob.download_as_text()
+        print(f"[EMAIL] Token loaded from GCS: gs://{bucket_name}/{blob_name}")
+        sys.stdout.flush()
+        return token_json
+    except Exception as e:
+        print(f"[EMAIL] Error loading token from GCS: {str(e)}")
+        sys.stdout.flush()
+        return None
+
+
 def save_token(creds: Credentials, token_path: str = None):
     """
-    Guarda las credenciales OAuth2 en un archivo JSON.
+    Guarda las credenciales OAuth2 en GCS (persistente) y en archivo local (caché).
     
     Args:
         creds: Credenciales OAuth2
-        token_path: Ruta donde guardar el token
+        token_path: Ruta local donde guardar el token (caché)
     """
     token_path = token_path or TOKEN_PATH
+    token_json = creds.to_json()
     
+    # 1. Guardar en GCS (persistente) - es lo prioritario
+    gcs_saved = _save_token_to_gcs(token_json)
+    
+    # 2. Guardar en archivo local como caché (en /tmp que es escribible en Cloud Run)
     try:
-        # Crear directorio si no existe
         token_dir = os.path.dirname(token_path)
         if token_dir and not os.path.exists(token_dir):
-            os.makedirs(token_dir)
+            os.makedirs(token_dir, exist_ok=True)
         
         with open(token_path, 'w') as token_file:
-            token_file.write(creds.to_json())
+            token_file.write(token_json)
         
-        print(f"[EMAIL] Token saved to {token_path}")
+        print(f"[EMAIL] Token saved to local cache: {token_path}")
         sys.stdout.flush()
     except Exception as e:
-        print(f"[EMAIL] Error saving token: {str(e)}")
+        print(f"[EMAIL] Warning: Could not save token to local cache: {str(e)}")
+        sys.stdout.flush()
+    
+    if not gcs_saved:
+        print("[EMAIL] WARNING: Token was NOT saved to GCS. It may be lost on container restart.")
         sys.stdout.flush()
 
 
@@ -624,7 +732,8 @@ def create_message(
     body_html: Optional[str] = None,
     cc: Optional[List[str]] = None,
     bcc: Optional[List[str]] = None,
-    attachments: Optional[List[Dict[str, Any]]] = None
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    inline_images: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, str]:
     """
     Crea un mensaje de correo en formato MIME.
@@ -638,12 +747,21 @@ def create_message(
         cc: Lista de correos en copia (opcional)
         bcc: Lista de correos en copia oculta (opcional)
         attachments: Lista de adjuntos [{filename, content, mime_type}] (opcional)
+        inline_images: Lista de imágenes inline [{filename, content, content_id, subtype}] (opcional).
+                       Se referencian en HTML como src="cid:<content_id>".
         
     Returns:
         Dict con el mensaje codificado en base64 para Gmail API
     """
-    if body_html or attachments:
-        message = MIMEMultipart('alternative' if body_html and not attachments else 'mixed')
+    has_inline = inline_images and len(inline_images) > 0
+
+    if body_html or attachments or has_inline:
+        if has_inline:
+            message = MIMEMultipart('related')
+        elif attachments:
+            message = MIMEMultipart('mixed')
+        else:
+            message = MIMEMultipart('alternative')
     else:
         message = MIMEText(body_text, 'plain', 'utf-8')
     
@@ -659,11 +777,11 @@ def create_message(
     # Agregar cuerpo
     if isinstance(message, MIMEMultipart):
         if body_html:
-            # Crear parte alternativa con texto y HTML
-            if attachments:
-                alt_part = MIMEMultipart('alternative')
-                alt_part.attach(MIMEText(body_text, 'plain', 'utf-8'))
-                alt_part.attach(MIMEText(body_html, 'html', 'utf-8'))
+            alt_part = MIMEMultipart('alternative')
+            alt_part.attach(MIMEText(body_text, 'plain', 'utf-8'))
+            alt_part.attach(MIMEText(body_html, 'html', 'utf-8'))
+
+            if has_inline or attachments:
                 message.attach(alt_part)
             else:
                 message.attach(MIMEText(body_text, 'plain', 'utf-8'))
@@ -671,6 +789,17 @@ def create_message(
         else:
             message.attach(MIMEText(body_text, 'plain', 'utf-8'))
         
+        # Agregar imágenes inline (CID)
+        if has_inline:
+            for img in inline_images:
+                img_data = img.get('content')
+                if img_data:
+                    subtype = img.get('subtype', 'png')
+                    mime_img = MIMEImage(img_data, _subtype=subtype)
+                    mime_img.add_header('Content-ID', f"<{img['content_id']}>")
+                    mime_img.add_header('Content-Disposition', 'inline', filename=img.get('filename', f"{img['content_id']}.{subtype}"))
+                    message.attach(mime_img)
+
         # Agregar adjuntos
         if attachments:
             for attachment in attachments:
@@ -702,6 +831,7 @@ def send_email(
     cc: Optional[List[str]] = None,
     bcc: Optional[List[str]] = None,
     attachments: Optional[List[Dict[str, Any]]] = None,
+    inline_images: Optional[List[Dict[str, Any]]] = None,
     user_id: str = 'me'
 ) -> Tuple[bool, Dict[str, Any]]:
     """
@@ -717,6 +847,7 @@ def send_email(
         cc: Lista de correos en copia (opcional)
         bcc: Lista de correos en copia oculta (opcional)
         attachments: Lista de adjuntos (opcional)
+        inline_images: Lista de imágenes inline [{filename, content, content_id, subtype}] (opcional)
         user_id: ID del usuario de Gmail (default: 'me')
         
     Returns:
@@ -743,7 +874,8 @@ def send_email(
             body_html=body_html,
             cc=cc,
             bcc=bcc,
-            attachments=attachments
+            attachments=attachments,
+            inline_images=inline_images
         )
         
         # Enviar mensaje
@@ -1059,15 +1191,34 @@ def check_gmail_auth_status(token_path: str = None) -> Dict[str, Any]:
         'error': None
     }
     
-    if not os.path.exists(token_path):
-        result['error'] = 'No token file found. Authorization required.'
+    # Intentar cargar token: primero GCS, luego local
+    creds = None
+    token_json = _load_token_from_gcs()
+    
+    if token_json:
+        try:
+            token_data = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(token_data)
+            result['token_exists'] = True
+            result['token_source'] = 'gcs'
+        except Exception as e:
+            print(f"[EMAIL] Error loading token from GCS in status check: {str(e)}")
+            sys.stdout.flush()
+    
+    if not creds and os.path.exists(token_path):
+        try:
+            creds = Credentials.from_authorized_user_file(token_path)
+            result['token_exists'] = True
+            result['token_source'] = 'local'
+        except Exception as e:
+            print(f"[EMAIL] Error loading token from local in status check: {str(e)}")
+            sys.stdout.flush()
+    
+    if not creds:
+        result['error'] = 'No token found (checked GCS and local). Authorization required.'
         return result
     
-    result['token_exists'] = True
-    
     try:
-        # Cargar sin especificar scopes para evitar validación estricta
-        creds = Credentials.from_authorized_user_file(token_path)
         result['scopes'] = list(creds.scopes) if creds.scopes else []
         
         if creds.valid:

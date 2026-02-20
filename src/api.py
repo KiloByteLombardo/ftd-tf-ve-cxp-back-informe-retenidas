@@ -51,6 +51,7 @@ REIM_MAX_RETRIES = int(os.getenv("REIM_MAX_RETRIES", "15"))
 
 # Tabla de Grist para resultados REIM
 GRIST_REIM_TABLE_ID = os.getenv("GRIST_REIM_TABLE_ID", "Liberar_Unidades")
+GRIST_REPORTADO_TABLE_ID = os.getenv("GRIST_REPORTADO_TABLE_ID", "Reportado_a_Tienda")
 
 def get_credentials():
     """
@@ -1422,6 +1423,178 @@ def gmail_auth_callback():
 
 
 # ============================================================================
+# ENDPOINTS DE ACTUALIZACIÓN DE SECRETOS (client_secret / gmail_token)
+# ============================================================================
+
+@app.route('/auth/gmail/update-client-secret', methods=['POST'])
+def update_client_secret():
+    """
+    Actualiza el archivo client_secret.json.
+    Útil cuando se rota el client secret en Google Cloud Console.
+    
+    Request: multipart/form-data con campo 'file' (el client_secret.json)
+    
+    Returns:
+        JSON con el resultado de la actualización
+    """
+    print("=" * 50)
+    print("[UPDATE-SECRET] Updating client_secret.json")
+    sys.stdout.flush()
+
+    try:
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided',
+                'message': 'Please upload client_secret.json as form-data with field name "file"'
+            }), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'Empty filename',
+                'message': 'Please select a file'
+            }), 400
+
+        # Validar que sea JSON válido
+        try:
+            content = file.read()
+            json.loads(content)
+        except json.JSONDecodeError:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid JSON',
+                'message': 'The uploaded file is not valid JSON'
+            }), 400
+
+        # Guardar en la ruta configurada
+        client_secret_path = os.getenv('GMAIL_CLIENT_SECRET_PATH', '/app/client_secret.json')
+
+        # Crear directorio si no existe
+        secret_dir = os.path.dirname(client_secret_path)
+        if secret_dir and not os.path.exists(secret_dir):
+            os.makedirs(secret_dir, exist_ok=True)
+
+        with open(client_secret_path, 'wb') as f:
+            f.write(content)
+
+        print(f"[UPDATE-SECRET] client_secret.json updated at {client_secret_path}")
+        print("=" * 50)
+        sys.stdout.flush()
+
+        return jsonify({
+            'success': True,
+            'message': f'client_secret.json updated successfully at {client_secret_path}',
+            'note': 'You will need to re-authorize Gmail via GET /auth/gmail after updating the client secret'
+        }), 200
+
+    except Exception as e:
+        print(f"[UPDATE-SECRET] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/auth/gmail/update-token', methods=['POST'])
+def update_gmail_token():
+    """
+    Actualiza el archivo gmail_token.json.
+    Útil cuando el token se invalida por cambio de contraseña.
+    
+    Request: multipart/form-data con campo 'file' (el gmail_token.json)
+    
+    Returns:
+        JSON con el resultado de la actualización
+    """
+    print("=" * 50)
+    print("[UPDATE-TOKEN] Updating gmail_token.json")
+    sys.stdout.flush()
+
+    try:
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided',
+                'message': 'Please upload gmail_token.json as form-data with field name "file"'
+            }), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'Empty filename',
+                'message': 'Please select a file'
+            }), 400
+
+        # Validar que sea JSON válido
+        try:
+            content = file.read()
+            json.loads(content)
+        except json.JSONDecodeError:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid JSON',
+                'message': 'The uploaded file is not valid JSON'
+            }), 400
+
+        # Guardar en GCS (persistente) y en local (/tmp como caché)
+        token_json_str = content.decode('utf-8')
+        
+        # Guardar en GCS
+        gcs_saved = emailSend._save_token_to_gcs(token_json_str)
+        
+        # Guardar en local como caché
+        token_path = os.getenv('GMAIL_TOKEN_PATH', '/tmp/gmail_token.json')
+        try:
+            token_dir = os.path.dirname(token_path)
+            if token_dir and not os.path.exists(token_dir):
+                os.makedirs(token_dir, exist_ok=True)
+            with open(token_path, 'wb') as f:
+                f.write(content)
+            print(f"[UPDATE-TOKEN] gmail_token.json saved to local cache: {token_path}")
+        except Exception as local_err:
+            print(f"[UPDATE-TOKEN] Warning: Could not save to local cache: {local_err}")
+
+        print(f"[UPDATE-TOKEN] gmail_token.json updated (GCS: {'OK' if gcs_saved else 'FAILED'})")
+        print("=" * 50)
+        sys.stdout.flush()
+
+        # Verificar que el token sea funcional
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+        if gmail_creds:
+            auth_status = emailSend.check_gmail_auth_status()
+            return jsonify({
+                'success': True,
+                'message': f'gmail_token.json updated successfully (GCS: {"OK" if gcs_saved else "FAILED"})',
+                'gcs_saved': gcs_saved,
+                'auth_status': auth_status
+            }), 200
+        else:
+            return jsonify({
+                'success': True,
+                'message': f'gmail_token.json updated, but token may need re-authorization',
+                'gcs_saved': gcs_saved,
+                'warning': gmail_error,
+                'auth_endpoint': '/auth/gmail'
+            }), 200
+
+    except Exception as e:
+        print(f"[UPDATE-TOKEN] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+# ============================================================================
 # ENDPOINTS DE ENVÍO DE EMAIL
 # ============================================================================
 
@@ -2051,21 +2224,69 @@ def search_email_endpoint():
         }), 500
 
 
-def _reim_poll_and_send_email(
+def _upload_reim_results_to_grist(results: list, extra_fields: dict, table_id: str, log_prefix: str):
+    """
+    Sube los resultados REIM combinados con campos extra a una tabla de Grist.
+    Reutilizable por cualquier flujo que necesite cargar datos REIM a Grist.
+    """
+    grist_records = []
+    for item in results:
+        reim_fields = {
+            "order_id": item.get("order_id", ""),
+            "invoice": item.get("invoice", ""),
+            "item_description": item.get("item_description", ""),
+            "invoice_qty": item.get("invoice_qty", 0),
+            "receipt_avail_qty": item.get("receipt_avail_qty", 0),
+            "qty_variance": item.get("qty_variance", 0),
+            "supplier": item.get("supplier", ""),
+            "status": item.get("status", ""),
+            "verification_date": str(item.get("verification_date", "")),
+            "execution_id": item.get("execution_id", "")
+        }
+        fields = {**extra_fields, **reim_fields}
+        grist_records.append({"fields": fields})
+
+    grist_payload = {"records": grist_records}
+    grist_url = f"{SERVER_URL}/{DOC_ID}/tables/{table_id}/records"
+
+    print(f"{log_prefix} Uploading {len(grist_records)} records to Grist table '{table_id}'...")
+    sys.stdout.flush()
+
+    try:
+        grist_resp = requests.post(
+            grist_url,
+            headers=HEADERS,
+            json=grist_payload,
+            timeout=120
+        )
+
+        if grist_resp.status_code in [200, 201]:
+            print(f"{log_prefix} Successfully uploaded {len(grist_records)} records to Grist.")
+        else:
+            print(f"{log_prefix} ERROR uploading to Grist: {grist_resp.status_code} - {grist_resp.text}")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"{log_prefix} ERROR calling Grist API: {str(e)}")
+        sys.stdout.flush()
+
+
+def _reim_poll_and_send_recepcion(
     execution_id: str,
     order_id: str,
     recipient_email: str,
     tienda: str,
     gmail_creds,
-    sender: str
+    sender: str,
+    extra_fields: dict = None
 ):
     """
-    Función que corre en un hilo en background.
+    Función que corre en un hilo en background para correos de RECEPCIÓN.
     Hace polling al endpoint de resultados REIM cada REIM_POLL_INTERVAL segundos,
     hasta un máximo de REIM_MAX_RETRIES intentos.
-    Cuando obtiene resultados exitosos, envía el correo formateado.
+    Cuando obtiene resultados exitosos, envía el correo y sube datos a Grist.
     """
-    log_prefix = f"[REIM-BG][OC:{order_id}][exec:{execution_id[:8]}]"
+    extra_fields = extra_fields or {}
+    log_prefix = f"[REIM-BG-REC][OC:{order_id}][exec:{execution_id[:8]}]"
     print(f"{log_prefix} Background thread started. Polling every {REIM_POLL_INTERVAL}s, max {REIM_MAX_RETRIES} retries.")
     sys.stdout.flush()
 
@@ -2102,7 +2323,7 @@ def _reim_poll_and_send_email(
 
                 for item in results:
                     desc = item.get("item_description", "N/A")
-                    variance = item.get("qty_variance", 0)
+                    variance = item.get("qty_variance") or 0
                     variance_int = int(variance) if variance == int(variance) else variance
                     items_text_lines.append(f"  - {desc} ({variance_int} UNIDADES)")
                     items_html_rows.append(f"""
@@ -2209,6 +2430,9 @@ Muchas gracias,"""
                 else:
                     print(f"{log_prefix} ERROR sending email: {result.get('error', 'Unknown')}")
                 sys.stdout.flush()
+
+                # --- Subir datos a Grist (Reportado_a_Tienda) ---
+                _upload_reim_results_to_grist(results, extra_fields, GRIST_REPORTADO_TABLE_ID, log_prefix)
                 return
 
             else:
@@ -2226,8 +2450,141 @@ Muchas gracias,"""
     sys.stdout.flush()
 
 
-@app.route('/send-email/reim', methods=['POST'])
-def send_email_reim_endpoint():
+def _reim_poll_and_send_inventario(
+    execution_id: str,
+    order_id: str,
+    recipient_email: str,
+    tienda: str,
+    gmail_creds,
+    sender: str,
+    extra_fields: dict = None
+):
+    """
+    Función que corre en un hilo en background para correos de INVENTARIO.
+    Hace polling al endpoint de resultados REIM cada REIM_POLL_INTERVAL segundos,
+    hasta un máximo de REIM_MAX_RETRIES intentos.
+    Cuando obtiene resultados exitosos, envía el correo y sube datos a Grist.
+    """
+    extra_fields = extra_fields or {}
+    log_prefix = f"[REIM-BG-INV][OC:{order_id}][exec:{execution_id[:8]}]"
+    print(f"{log_prefix} Background thread started. Polling every {REIM_POLL_INTERVAL}s, max {REIM_MAX_RETRIES} retries.")
+    sys.stdout.flush()
+
+    results_url = f"{REIM_RESULTS_URL}/{execution_id}"
+    params = {"mode": "quantity_variance"}
+
+    for attempt in range(1, REIM_MAX_RETRIES + 1):
+        try:
+            print(f"{log_prefix} Poll attempt {attempt}/{REIM_MAX_RETRIES} - waiting {REIM_POLL_INTERVAL}s...")
+            sys.stdout.flush()
+            time.sleep(REIM_POLL_INTERVAL)
+
+            print(f"{log_prefix} Calling GET {results_url}")
+            sys.stdout.flush()
+            resp = requests.get(results_url, params=params, timeout=60)
+
+            if resp.status_code != 200:
+                print(f"{log_prefix} HTTP {resp.status_code} - result not ready yet.")
+                sys.stdout.flush()
+                continue
+
+            data = resp.json()
+            status = data.get("status", "")
+            total = data.get("total", 0)
+
+            if status == "success" and total > 0:
+                print(f"{log_prefix} Results received! total={total}")
+                sys.stdout.flush()
+                results = data.get("results", [])
+
+                # --- Construir plantilla de correo (inventario) ---
+                items_text_lines = []
+                items_html_lines = []
+
+                for item in results:
+                    item_id = item.get("item_id", "")
+                    desc = item.get("item_description", "N/A")
+                    variance = item.get("qty_variance") or 0
+                    variance_int = int(variance) if variance == int(variance) else variance
+                    items_text_lines.append(f"{item_id} {desc} ({variance_int} UNIDADES)")
+                    items_html_lines.append(
+                        f'<p style="margin: 4px 0;">{item_id} {desc} ({variance_int} UNIDADES)</p>'
+                    )
+
+                items_text = "\n".join(items_text_lines)
+                items_html_all = "\n".join(items_html_lines)
+
+                subject = f"Discrepancia en inventario - OC {order_id} - {tienda}"
+
+                body_text = f"""Estimado equipo,
+
+Solicitamos su apoyo en validar el soporte de verificación de inventario, ya que la diferencia que visualizamos en sistema es del siguiente ítem y el soporte realizado en la Super App no coincide con esta información.
+
+{items_text}
+
+Se adjunta soporte para su validación
+
+Es importante que la respuesta sea a la brevedad posible.
+Muchas gracias,"""
+
+                body_html = f"""
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+    <p>Estimado equipo,</p>
+
+    <p>Solicitamos su apoyo en validar el soporte de verificación de inventario, ya que la diferencia que visualizamos en sistema es del siguiente ítem y el soporte realizado en la Super App no coincide con esta información.</p>
+
+    <div style="margin: 15px 0; padding: 10px; background-color: #f9f9f9; border-left: 3px solid #ddd;">
+        {items_html_all}
+    </div>
+
+    <p>Se adjunta soporte para su validación</p>
+
+    <p><strong>Es importante que la respuesta sea a la brevedad posible.</strong></p>
+    <p>Muchas gracias,</p>
+</body>
+</html>"""
+
+                # --- Enviar correo ---
+                print(f"{log_prefix} Sending email to {recipient_email}...")
+                sys.stdout.flush()
+
+                success, result = emailSend.send_email(
+                    credentials=gmail_creds,
+                    sender=sender,
+                    to=recipient_email,
+                    subject=subject,
+                    body_text=body_text,
+                    body_html=body_html
+                )
+
+                if success:
+                    print(f"{log_prefix} Email sent successfully to {recipient_email}")
+                else:
+                    print(f"{log_prefix} ERROR sending email: {result.get('error', 'Unknown')}")
+                sys.stdout.flush()
+
+                # --- Subir datos a Grist (Reportado_a_Tienda) ---
+                _upload_reim_results_to_grist(results, extra_fields, GRIST_REPORTADO_TABLE_ID, log_prefix)
+                return
+
+            else:
+                print(f"{log_prefix} status='{status}', total={total} - not ready yet.")
+                sys.stdout.flush()
+
+        except Exception as e:
+            print(f"{log_prefix} ERROR on attempt {attempt}: {str(e)}")
+            sys.stdout.flush()
+            import traceback
+            traceback.print_exc()
+
+    # Si llegamos aquí, se agotaron los reintentos
+    print(f"{log_prefix} MAX RETRIES ({REIM_MAX_RETRIES}) EXCEEDED. Giving up.")
+    sys.stdout.flush()
+
+
+@app.route('/send-email/recepcion', methods=['POST'])
+def send_email_recepcion_endpoint():
     """
     Endpoint para consultar REIM por varianza de cantidad y enviar correo con los resultados.
     
@@ -2249,15 +2606,15 @@ def send_email_reim_endpoint():
         JSON con execution_id (respuesta inmediata)
     """
     print("=" * 50)
-    print("[SEND-EMAIL-REIM] Endpoint called")
-    print(f"[SEND-EMAIL-REIM] Method: {request.method}")
-    print(f"[SEND-EMAIL-REIM] Content-Type: {request.content_type}")
+    print("[SEND-EMAIL-RECEPCION] Endpoint called")
+    print(f"[SEND-EMAIL-RECEPCION] Method: {request.method}")
+    print(f"[SEND-EMAIL-RECEPCION] Content-Type: {request.content_type}")
     sys.stdout.flush()
 
     try:
         # Verificar JSON
         if not request.is_json:
-            print("[SEND-EMAIL-REIM] Error: Request must be JSON")
+            print("[SEND-EMAIL-RECEPCION] Error: Request must be JSON")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2278,7 +2635,7 @@ def send_email_reim_endpoint():
             missing.append('Tienda')
 
         if missing:
-            print(f"[SEND-EMAIL-REIM] Error: Missing required fields: {missing}")
+            print(f"[SEND-EMAIL-RECEPCION] Error: Missing required fields: {missing}")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2289,7 +2646,7 @@ def send_email_reim_endpoint():
 
         # Validar configuración REIM
         if not REIM_TRIGGER_URL or not REIM_RESULTS_URL:
-            print("[SEND-EMAIL-REIM] Error: REIM URLs not configured")
+            print("[SEND-EMAIL-RECEPCION] Error: REIM URLs not configured")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2298,7 +2655,7 @@ def send_email_reim_endpoint():
             }), 500
 
         # --- Paso 1: Buscar correo del destinatario en Google Sheet ---
-        print(f"[SEND-EMAIL-REIM] Looking up email for Tienda='{tienda}'...")
+        print(f"[SEND-EMAIL-RECEPCION] Looking up email for Tienda='{tienda}'...")
         sys.stdout.flush()
 
         spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
@@ -2307,7 +2664,7 @@ def send_email_reim_endpoint():
         email_column = 'Correo Electrónico'
 
         if not spreadsheet_id:
-            print("[SEND-EMAIL-REIM] Error: No spreadsheet_id configured")
+            print("[SEND-EMAIL-RECEPCION] Error: No spreadsheet_id configured")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2326,7 +2683,7 @@ def send_email_reim_endpoint():
         )
 
         if not recipient_email:
-            print(f"[SEND-EMAIL-REIM] Error: No email found for Tienda='{tienda}'")
+            print(f"[SEND-EMAIL-RECEPCION] Error: No email found for Tienda='{tienda}'")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2334,14 +2691,14 @@ def send_email_reim_endpoint():
                 'message': 'Please check the Tienda name or update the contact sheet'
             }), 404
 
-        print(f"[SEND-EMAIL-REIM] Found email: {recipient_email}")
+        print(f"[SEND-EMAIL-RECEPCION] Found email: {recipient_email}")
         sys.stdout.flush()
 
         # --- Paso 2: Verificar credenciales Gmail ---
         gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
 
         if gmail_error or not gmail_creds:
-            print(f"[SEND-EMAIL-REIM] Error: Gmail not authorized - {gmail_error}")
+            print(f"[SEND-EMAIL-RECEPCION] Error: Gmail not authorized - {gmail_error}")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2356,8 +2713,31 @@ def send_email_reim_endpoint():
             auth_status = emailSend.check_gmail_auth_status()
             sender = auth_status.get('email', '')
 
+        # --- Extraer campos opcionales para Grist (Reportado_a_Tienda) ---
+        grist_columns = [
+            'Fecha_Recepcion', 'Tienda', 'Proveedor', 'Numero_Factura',
+            'Estado', 'Orden_Compra', 'Fecha_Factura', 'SubTotal',
+            'Costo_Recepcion', 'Unidades_Recibidas', 'Fecha_Publicacion',
+            'Tipo_de_Proveedor', 'Motivo_de_Retencion', 'Validacion_de_OC',
+            'Diferencia_Real', 'Valor_Real_de_Unidades', 'Diferencia_Unidades',
+            'Valor_Real_de_Subtotal', 'Diferencia_Costo', 'Area',
+            'Gerente_de_Area', 'Especialista_Comercial'
+        ]
+        extra_fields = {}
+        for col in grist_columns:
+            value = data.get(col)
+            if value is not None:
+                extra_fields[col] = value
+        if 'Orden_Compra' not in extra_fields:
+            extra_fields['Orden_Compra'] = str(order_id)
+        if 'Tienda' not in extra_fields:
+            extra_fields['Tienda'] = tienda
+
+        print(f"[SEND-EMAIL-RECEPCION] Extra Grist fields: {list(extra_fields.keys())}")
+        sys.stdout.flush()
+
         # --- Paso 3: Llamar al endpoint REIM trigger ---
-        print(f"[SEND-EMAIL-REIM] Calling REIM trigger for order_id={order_id}...")
+        print(f"[SEND-EMAIL-RECEPCION] Calling REIM trigger for order_id={order_id}...")
         sys.stdout.flush()
 
         # Enviar como multipart/form-data (el endpoint REIM lo requiere)
@@ -2369,19 +2749,19 @@ def send_email_reim_endpoint():
 
         try:
             reim_resp = requests.post(REIM_TRIGGER_URL, files=form_fields, timeout=60)
-            print(f"[SEND-EMAIL-REIM] REIM response status: {reim_resp.status_code}")
-            print(f"[SEND-EMAIL-REIM] REIM response body: {reim_resp.text}")
+            print(f"[SEND-EMAIL-RECEPCION] REIM response status: {reim_resp.status_code}")
+            print(f"[SEND-EMAIL-RECEPCION] REIM response body: {reim_resp.text}")
             sys.stdout.flush()
             reim_resp.raise_for_status()
             reim_data = reim_resp.json()
         except requests.exceptions.RequestException as e:
-            print(f"[SEND-EMAIL-REIM] Error calling REIM trigger: {str(e)}")
+            print(f"[SEND-EMAIL-RECEPCION] Error calling REIM trigger: {str(e)}")
             sys.stdout.flush()
             # Intentar capturar el body de la respuesta de error
             error_body = None
             if hasattr(e, 'response') and e.response is not None:
                 error_body = e.response.text
-                print(f"[SEND-EMAIL-REIM] REIM error response body: {error_body}")
+                print(f"[SEND-EMAIL-RECEPCION] REIM error response body: {error_body}")
                 sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2392,7 +2772,7 @@ def send_email_reim_endpoint():
 
         execution_id = reim_data.get('execution_id')
         if not execution_id:
-            print(f"[SEND-EMAIL-REIM] Error: No execution_id in REIM response: {reim_data}")
+            print(f"[SEND-EMAIL-RECEPCION] Error: No execution_id in REIM response: {reim_data}")
             sys.stdout.flush()
             return jsonify({
                 'success': False,
@@ -2400,26 +2780,27 @@ def send_email_reim_endpoint():
                 'reim_response': reim_data
             }), 502
 
-        print(f"[SEND-EMAIL-REIM] Got execution_id: {execution_id}")
+        print(f"[SEND-EMAIL-RECEPCION] Got execution_id: {execution_id}")
         sys.stdout.flush()
 
         # --- Paso 4: Lanzar hilo en background ---
         bg_thread = threading.Thread(
-            target=_reim_poll_and_send_email,
+            target=_reim_poll_and_send_recepcion,
             args=(
                 execution_id,
                 str(order_id),
                 recipient_email,
                 tienda,
                 gmail_creds,
-                sender
+                sender,
+                extra_fields
             ),
             daemon=True,
             name=f"reim-poll-{order_id}"
         )
         bg_thread.start()
 
-        print(f"[SEND-EMAIL-REIM] Background thread launched: {bg_thread.name}")
+        print(f"[SEND-EMAIL-RECEPCION] Background thread launched: {bg_thread.name}")
         print("=" * 50)
         sys.stdout.flush()
 
@@ -2436,7 +2817,249 @@ def send_email_reim_endpoint():
         }), 200
 
     except Exception as e:
-        print(f"[SEND-EMAIL-REIM] Error: {str(e)}")
+        print(f"[SEND-EMAIL-RECEPCION] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/send-email/inventario', methods=['POST'])
+def send_email_inventario_endpoint():
+    """
+    Endpoint para consultar REIM por varianza de cantidad y enviar correo
+    con plantilla de INVENTARIO.
+
+    Flujo:
+    1. Recibe order_id y Tienda
+    2. Busca el correo del destinatario en Google Sheets por Tienda
+    3. Llama al endpoint REIM trigger (form-data)
+    4. Obtiene execution_id
+    5. Lanza un hilo en background que hace polling al endpoint de resultados
+    6. Retorna inmediatamente al usuario con el execution_id
+
+    Request Body (JSON):
+    {
+        "order_id": "38696664",
+        "Tienda": "Tienda Centro"
+    }
+
+    Returns:
+        JSON con execution_id (respuesta inmediata)
+    """
+    print("=" * 50)
+    print("[SEND-EMAIL-INVENTARIO] Endpoint called")
+    print(f"[SEND-EMAIL-INVENTARIO] Method: {request.method}")
+    print(f"[SEND-EMAIL-INVENTARIO] Content-Type: {request.content_type}")
+    sys.stdout.flush()
+
+    try:
+        if not request.is_json:
+            print("[SEND-EMAIL-INVENTARIO] Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+
+        data = request.get_json()
+
+        order_id = data.get('order_id')
+        tienda = data.get('Tienda')
+
+        missing = []
+        if not order_id:
+            missing.append('order_id')
+        if not tienda:
+            missing.append('Tienda')
+
+        if missing:
+            print(f"[SEND-EMAIL-INVENTARIO] Error: Missing required fields: {missing}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing,
+                'message': f'Please provide: {", ".join(missing)}'
+            }), 400
+
+        if not REIM_TRIGGER_URL or not REIM_RESULTS_URL:
+            print("[SEND-EMAIL-INVENTARIO] Error: REIM URLs not configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'REIM not configured',
+                'message': 'Please set REIM_TRIGGER_URL and REIM_RESULTS_URL in .env'
+            }), 500
+
+        # --- Paso 1: Buscar correo del destinatario en Google Sheet ---
+        print(f"[SEND-EMAIL-INVENTARIO] Looking up email for Tienda='{tienda}'...")
+        sys.stdout.flush()
+
+        spreadsheet_id = data.get('spreadsheet_id', EMAIL_SPREADSHEET_ID)
+        worksheet_name = data.get('worksheet_name', EMAIL_WORKSHEET_NAME)
+        search_column = 'Tienda'
+        email_column = 'Correo Electrónico'
+
+        if not spreadsheet_id:
+            print("[SEND-EMAIL-INVENTARIO] Error: No spreadsheet_id configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id configured',
+                'message': 'Please set EMAIL_SPREADSHEET_ID in .env or provide spreadsheet_id in request'
+            }), 400
+
+        sheets_credentials, project_id = get_credentials()
+        recipient_email, row_data = emailSend.search_email_in_sheet(
+            credentials=sheets_credentials,
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            search_column=search_column,
+            search_value=tienda,
+            email_column=email_column
+        )
+
+        if not recipient_email:
+            print(f"[SEND-EMAIL-INVENTARIO] Error: No email found for Tienda='{tienda}'")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': f"No email found for Tienda '{tienda}' in Google Sheet",
+                'message': 'Please check the Tienda name or update the contact sheet'
+            }), 404
+
+        print(f"[SEND-EMAIL-INVENTARIO] Found email: {recipient_email}")
+        sys.stdout.flush()
+
+        # --- Paso 2: Verificar credenciales Gmail ---
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+
+        if gmail_error or not gmail_creds:
+            print(f"[SEND-EMAIL-INVENTARIO] Error: Gmail not authorized - {gmail_error}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+
+        sender = data.get('sender', os.getenv('EMAIL_SENDER', ''))
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+
+        # --- Extraer campos opcionales para Grist (Reportado_a_Tienda) ---
+        grist_columns = [
+            'Fecha_Recepcion', 'Tienda', 'Proveedor', 'Numero_Factura',
+            'Estado', 'Orden_Compra', 'Fecha_Factura', 'SubTotal',
+            'Costo_Recepcion', 'Unidades_Recibidas', 'Fecha_Publicacion',
+            'Tipo_de_Proveedor', 'Motivo_de_Retencion', 'Validacion_de_OC',
+            'Diferencia_Real', 'Valor_Real_de_Unidades', 'Diferencia_Unidades',
+            'Valor_Real_de_Subtotal', 'Diferencia_Costo', 'Area',
+            'Gerente_de_Area', 'Especialista_Comercial'
+        ]
+        extra_fields = {}
+        for col in grist_columns:
+            value = data.get(col)
+            if value is not None:
+                extra_fields[col] = value
+        if 'Orden_Compra' not in extra_fields:
+            extra_fields['Orden_Compra'] = str(order_id)
+        if 'Tienda' not in extra_fields:
+            extra_fields['Tienda'] = tienda
+
+        print(f"[SEND-EMAIL-INVENTARIO] Extra Grist fields: {list(extra_fields.keys())}")
+        sys.stdout.flush()
+
+        # --- Paso 3: Llamar al endpoint REIM trigger ---
+        print(f"[SEND-EMAIL-INVENTARIO] Calling REIM trigger for order_id={order_id}...")
+        sys.stdout.flush()
+
+        form_fields = {
+            'order_id': (None, str(order_id)),
+            'mode': (None, 'quantity_variance'),
+            'email': (None, 'grist-server@farmatodo.com')
+        }
+
+        try:
+            reim_resp = requests.post(REIM_TRIGGER_URL, files=form_fields, timeout=60)
+            print(f"[SEND-EMAIL-INVENTARIO] REIM response status: {reim_resp.status_code}")
+            print(f"[SEND-EMAIL-INVENTARIO] REIM response body: {reim_resp.text}")
+            sys.stdout.flush()
+            reim_resp.raise_for_status()
+            reim_data = reim_resp.json()
+        except requests.exceptions.RequestException as e:
+            print(f"[SEND-EMAIL-INVENTARIO] Error calling REIM trigger: {str(e)}")
+            sys.stdout.flush()
+            error_body = None
+            if hasattr(e, 'response') and e.response is not None:
+                error_body = e.response.text
+                print(f"[SEND-EMAIL-INVENTARIO] REIM error response body: {error_body}")
+                sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Failed to call REIM trigger endpoint',
+                'message': str(e),
+                'reim_response_body': error_body
+            }), 502
+
+        execution_id = reim_data.get('execution_id')
+        if not execution_id:
+            print(f"[SEND-EMAIL-INVENTARIO] Error: No execution_id in REIM response: {reim_data}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No execution_id returned by REIM',
+                'reim_response': reim_data
+            }), 502
+
+        print(f"[SEND-EMAIL-INVENTARIO] Got execution_id: {execution_id}")
+        sys.stdout.flush()
+
+        # --- Paso 4: Lanzar hilo en background ---
+        bg_thread = threading.Thread(
+            target=_reim_poll_and_send_inventario,
+            args=(
+                execution_id,
+                str(order_id),
+                recipient_email,
+                tienda,
+                gmail_creds,
+                sender,
+                extra_fields
+            ),
+            daemon=True,
+            name=f"reim-inv-poll-{order_id}"
+        )
+        bg_thread.start()
+
+        print(f"[SEND-EMAIL-INVENTARIO] Background thread launched: {bg_thread.name}")
+        print("=" * 50)
+        sys.stdout.flush()
+
+        # --- Paso 5: Retornar inmediatamente ---
+        return jsonify({
+            'success': True,
+            'message': f'REIM inventario process started. Email will be sent to {recipient_email} when results are ready.',
+            'execution_id': execution_id,
+            'order_id': str(order_id),
+            'recipient_email': recipient_email,
+            'tienda': tienda,
+            'poll_interval_seconds': REIM_POLL_INTERVAL,
+            'max_retries': REIM_MAX_RETRIES
+        }), 200
+
+    except Exception as e:
+        print(f"[SEND-EMAIL-INVENTARIO] Error: {str(e)}")
         print("=" * 50)
         sys.stdout.flush()
         import traceback
@@ -2450,16 +3073,19 @@ def send_email_reim_endpoint():
 
 def _reim_poll_and_upload_grist(
     execution_id: str,
-    order_id: str
+    order_id: str,
+    extra_fields: dict
 ):
     """
     Función que corre en un hilo en background.
     Hace polling al endpoint de resultados REIM cada REIM_POLL_INTERVAL segundos,
     hasta un máximo de REIM_MAX_RETRIES intentos.
-    Cuando obtiene resultados exitosos, sube los datos a la tabla Grist (Liberar_Unidades).
+    Cuando obtiene resultados exitosos, combina los campos extra del request original
+    con los datos de REIM y sube todo a la tabla Grist (Liberar_Unidades).
     """
     log_prefix = f"[REIM-GRIST-BG][OC:{order_id}][exec:{execution_id[:8]}]"
     print(f"{log_prefix} Background thread started. Polling every {REIM_POLL_INTERVAL}s, max {REIM_MAX_RETRIES} retries.")
+    print(f"{log_prefix} Extra fields from request: {list(extra_fields.keys())}")
     sys.stdout.flush()
 
     results_url = f"{REIM_RESULTS_URL}/{execution_id}"
@@ -2492,7 +3118,8 @@ def _reim_poll_and_upload_grist(
                 # --- Mapear resultados a registros de Grist ---
                 grist_records = []
                 for item in results:
-                    fields = {
+                    # Campos REIM
+                    reim_fields = {
                         "order_id": item.get("order_id", ""),
                         "invoice": item.get("invoice", ""),
                         "item_description": item.get("item_description", ""),
@@ -2504,6 +3131,9 @@ def _reim_poll_and_upload_grist(
                         "verification_date": str(item.get("verification_date", "")),
                         "execution_id": item.get("execution_id", "")
                     }
+                    # Combinar: campos extra del request + campos REIM
+                    # REIM tiene prioridad si hay conflicto de nombres
+                    fields = {**extra_fields, **reim_fields}
                     grist_records.append({"fields": fields})
 
                 grist_payload = {"records": grist_records}
@@ -2554,16 +3184,42 @@ def reim_grist_endpoint():
     a la tabla Grist 'Liberar_Unidades'.
     
     Flujo:
-    1. Recibe order_id
+    1. Recibe order_id y campos opcionales para la tabla Grist
     2. Llama al endpoint REIM trigger (form-data)
     3. Obtiene execution_id
     4. Lanza un hilo en background que hace polling al endpoint de resultados
-    5. Cuando obtiene resultados, los sube a Grist
+    5. Cuando obtiene resultados, combina los campos del request con los de REIM y los sube a Grist
     6. Retorna inmediatamente al usuario con el execution_id
     
     Request Body (JSON):
     {
-        "order_id": "38696664"
+        "order_id": "38696664",           // REQUERIDO
+        "Fecha_Recepcion": "",             // Opcional
+        "Tienda": "",                      // Opcional
+        "Proveedor": "",                   // Opcional
+        "Numero_Factura": "",              // Opcional
+        "Estado": "",                      // Opcional
+        "Orden_Compra": "",                // Opcional
+        "Fecha_Factura": "",               // Opcional
+        "SubTotal": "",                    // Opcional
+        "Costo_Recepcion": "",             // Opcional
+        "Unidades_Recibidas": "",          // Opcional
+        "Fecha_Publicacion": "",           // Opcional
+        "Tipo_de_Proveedor": "",           // Opcional
+        "Motivo_de_Retencion": "",         // Opcional
+        "Validacion_de_OC": "",            // Opcional
+        "Diferencia_Real": "",             // Opcional
+        "Valor_Real_de_Unidades": "",      // Opcional
+        "Diferencia_Unidades": "",         // Opcional
+        "Valor_Real_de_Subtotal": "",      // Opcional
+        "Diferencia_Costo": "",            // Opcional
+        "Area": "",                        // Opcional
+        "Gerente_de_Area": "",             // Opcional
+        "Especialista_Comercial": "",      // Opcional
+        "Comentario": "",                  // Opcional
+        "Comentario_CXP": "",             // Opcional
+        "Filtro": "",                      // Opcional
+        "Fecha_Reporte_CXP": ""           // Opcional
     }
     
     Returns:
@@ -2667,12 +3323,38 @@ def reim_grist_endpoint():
         print(f"[REIM-GRIST] Got execution_id: {execution_id}")
         sys.stdout.flush()
 
-        # --- Paso 2: Lanzar hilo en background ---
+        # --- Paso 2: Extraer campos opcionales para Grist ---
+        # Lista de columnas de la tabla Grist (Liberar_Unidades)
+        grist_columns = [
+            'Fecha_Recepcion', 'Tienda', 'Proveedor', 'Numero_Factura',
+            'Estado', 'Orden_Compra', 'Fecha_Factura', 'SubTotal',
+            'Costo_Recepcion', 'Unidades_Recibidas', 'Fecha_Publicacion',
+            'Tipo_de_Proveedor', 'Motivo_de_Retencion', 'Validacion_de_OC',
+            'Diferencia_Real', 'Valor_Real_de_Unidades', 'Diferencia_Unidades',
+            'Valor_Real_de_Subtotal', 'Diferencia_Costo', 'Area',
+            'Gerente_de_Area', 'Especialista_Comercial', 'Comentario',
+            'Comentario_CXP', 'Filtro', 'Fecha_Reporte_CXP'
+        ]
+        extra_fields = {}
+        for col in grist_columns:
+            value = data.get(col)
+            if value is not None:
+                extra_fields[col] = value
+
+        # Orden_Compra siempre se llena con order_id si no vino en el request
+        if 'Orden_Compra' not in extra_fields:
+            extra_fields['Orden_Compra'] = str(order_id)
+
+        print(f"[REIM-GRIST] Extra fields provided: {list(extra_fields.keys())}")
+        sys.stdout.flush()
+
+        # --- Paso 3: Lanzar hilo en background ---
         bg_thread = threading.Thread(
             target=_reim_poll_and_upload_grist,
             args=(
                 execution_id,
-                str(order_id)
+                str(order_id),
+                extra_fields
             ),
             daemon=True,
             name=f"reim-grist-{order_id}"
@@ -2683,7 +3365,7 @@ def reim_grist_endpoint():
         print("=" * 50)
         sys.stdout.flush()
 
-        # --- Paso 3: Retornar inmediatamente ---
+        # --- Paso 4: Retornar inmediatamente ---
         return jsonify({
             'success': True,
             'message': f'REIM process started. Results will be uploaded to Grist table "{GRIST_REIM_TABLE_ID}" when ready.',
@@ -2696,6 +3378,782 @@ def reim_grist_endpoint():
 
     except Exception as e:
         print(f"[REIM-GRIST] Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/send-email/nota-credito', methods=['POST'])
+def send_email_nota_credito_endpoint():
+    """
+    Endpoint para enviar correos de Nota de Crédito a proveedores.
+    Recibe directamente el correo del destinatario (no busca en Google Sheet).
+
+    Request Body (JSON):
+    {
+        "destinatario": "proveedor@dominio.com",
+        "proveedor": "ACME S.A.",
+        "registros": [
+            {
+                "Orden_Compra": "OC-00123",
+                "Numero_Factura": "F-88991",
+                "Fecha_Factura": "2026-02-18",
+                "Diferencia_Unidades": "5",
+                "Diferencia_Costo": "150.00"
+            }
+        ],
+        "subject": "...",       // Opcional
+        "cc": ["..."],          // Opcional
+        "bcc": ["..."],         // Opcional
+        "sender": "..."         // Opcional
+    }
+
+    Returns:
+        JSON con el resultado del envío
+    """
+    LOG_PREFIX = "[SEND-EMAIL-NOTA-CREDITO]"
+    print("=" * 50)
+    print(f"{LOG_PREFIX} Endpoint called")
+    print(f"{LOG_PREFIX} Method: {request.method}")
+    print(f"{LOG_PREFIX} Content-Type: {request.content_type}")
+    sys.stdout.flush()
+
+    try:
+        if not request.is_json:
+            print(f"{LOG_PREFIX} Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+
+        data = request.get_json()
+
+        # --- Validar campos requeridos ---
+        destinatario = data.get('destinatario', '').strip()
+        proveedor = data.get('proveedor', '').strip()
+        registros = data.get('registros')
+
+        missing_fields = []
+        if not destinatario:
+            missing_fields.append('destinatario')
+        if not proveedor:
+            missing_fields.append('proveedor')
+        if not registros:
+            missing_fields.append('registros')
+
+        if missing_fields:
+            print(f"{LOG_PREFIX} Error: Missing required fields: {missing_fields}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields',
+                'missing_fields': missing_fields,
+                'message': f'Please provide: {", ".join(missing_fields)}'
+            }), 400
+
+        if not isinstance(registros, list) or len(registros) == 0:
+            print(f"{LOG_PREFIX} Error: 'registros' must be a non-empty array")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': "'registros' must be a non-empty array",
+                'message': 'Provide at least one record with Orden_Compra, Numero_Factura, Fecha_Factura, Diferencia_Unidades, Diferencia_Costo'
+            }), 400
+
+        required_record_fields = ['Orden_Compra', 'Numero_Factura', 'Fecha_Factura', 'Diferencia_Unidades', 'Diferencia_Costo']
+        for idx, reg in enumerate(registros):
+            missing_in_record = [f for f in required_record_fields if reg.get(f) is None or reg.get(f) == ""]
+            if missing_in_record:
+                print(f"{LOG_PREFIX} Error: Record [{idx}] missing fields: {missing_in_record}")
+                sys.stdout.flush()
+                return jsonify({
+                    'success': False,
+                    'error': f'Record at index {idx} is missing required fields',
+                    'missing_fields': missing_in_record,
+                    'message': f'Each record must have: {", ".join(required_record_fields)}'
+                }), 400
+
+        # --- Obtener credenciales Gmail ---
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+
+        if gmail_error or not gmail_creds:
+            print(f"{LOG_PREFIX} Error: Gmail not authorized - {gmail_error}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+
+        sender = data.get('sender', os.getenv('EMAIL_SENDER', ''))
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+
+        # --- Construir asunto ---
+        subject = data.get('subject', f"Nota de Credito - {proveedor}")
+
+        # --- Construir tabla de registros en HTML ---
+        rows_html = ""
+        rows_text = ""
+        for i, reg in enumerate(registros, start=1):
+            bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+            rows_html += f"""
+                <tr style="background-color: {bg};">
+                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;">{i}</td>
+                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{reg['Orden_Compra']}</td>
+                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{reg['Numero_Factura']}</td>
+                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;">{reg['Fecha_Factura']}</td>
+                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;">{reg['Diferencia_Unidades']}</td>
+                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;">{reg['Diferencia_Costo']}</td>
+                </tr>"""
+            rows_text += f"  {i}. OC: {reg['Orden_Compra']} | Factura: {reg['Numero_Factura']} | Fecha: {reg['Fecha_Factura']} | Dif. Unidades: {reg['Diferencia_Unidades']} | Dif. Costo: {reg['Diferencia_Costo']}\n"
+
+        total_registros = len(registros)
+
+        body_html = f"""
+<html>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f4; padding: 20px 0;">
+        <tr>
+            <td align="center">
+                <table width="700" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                    <!-- Header -->
+                    <tr>
+                        <td style="background-color: #002858; padding: 24px 32px;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 600;">Nota de Cr&eacute;dito</h1>
+                        </td>
+                    </tr>
+                    <!-- Body -->
+                    <tr>
+                        <td style="padding: 32px;">
+                            <p style="margin: 0 0 16px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Estimado Proveedor,
+                            </p>
+                            <p style="margin: 0 0 16px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Le informamos que los siguientes documentos se encuentran retenidos por discrepancia de unidades y/o costos.
+                            </p>
+                            <p style="margin: 0 0 24px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Solicitamos su apoyo en la emisi&oacute;n y registro de la Nota de Cr&eacute;dito. A continuaci&oacute;n, se detalla la informaci&oacute;n:
+                            </p>
+
+                            <!-- Info summary -->
+                            <table style="border-collapse: collapse; margin-bottom: 24px; width: 100%;">
+                                <tr>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; background-color: #f5f5f5; width: 180px;"><strong>Proveedor</strong></td>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{proveedor}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; background-color: #f5f5f5;"><strong>Total de Registros</strong></td>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{total_registros}</td>
+                                </tr>
+                            </table>
+
+                            <!-- Records table -->
+                            <table style="border-collapse: collapse; width: 100%; margin-bottom: 24px;">
+                                <thead>
+                                    <tr style="background-color: #002858;">
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: center; font-size: 13px;">#</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: left; font-size: 13px;">OC</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: left; font-size: 13px;">Nro. Factura</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: center; font-size: 13px;">Fecha Factura</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: center; font-size: 13px;">Diferencia en Unidades</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: center; font-size: 13px;">Diferencia en Costos</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {rows_html}
+                                </tbody>
+                            </table>
+
+                            <p style="margin: 0 0 16px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Para la publicaci&oacute;n de NC por conceptos de discrepancia en unidades por devoluci&oacute;n/faltante en despacho o discrepancia de costos deben utilizar el m&oacute;dulo de facturaci&oacute;n, en la misma orden de compra de la factura afectada. Es importante recordar que la nota de cr&eacute;dito <strong>no debe ser publicada a trav&eacute;s del m&oacute;dulo de acuerdos comerciales</strong>.
+                            </p>
+                            <p style="margin: 0 0 8px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Quedamos atentos a sus comentarios,
+                            </p>
+                            <p style="margin: 24px 0 0 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Saludos cordiales,
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Footer -->
+                    <tr>
+                        <td style="background-color: #f5f5f5; padding: 16px 32px; text-align: center;">
+                            <p style="margin: 0; color: #999999; font-size: 12px;">
+                                Este es un correo autom&aacute;tico. Por favor no responda directamente a este mensaje.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
+
+        body_text = f"""Nota de Credito - {proveedor}
+
+Estimado Proveedor,
+
+Le informamos que los siguientes documentos se encuentran retenidos por discrepancia de unidades y/o costos.
+Solicitamos su apoyo en la emision y registro de la Nota de Credito. A continuacion, se detalla la informacion:
+
+Proveedor: {proveedor}
+Total de Registros: {total_registros}
+
+Detalle de Registros:
+{rows_text}
+Para la publicacion de NC por conceptos de discrepancia en unidades por devolucion/faltante en despacho o discrepancia de costos deben utilizar el modulo de facturacion, en la misma orden de compra de la factura afectada. Es importante recordar que la nota de credito no debe ser publicada a traves del modulo de acuerdos comerciales.
+
+Quedamos atentos a sus comentarios,
+
+Saludos cordiales,
+"""
+
+        print(f"{LOG_PREFIX} Destinatario: {destinatario}")
+        print(f"{LOG_PREFIX} Proveedor: {proveedor}")
+        print(f"{LOG_PREFIX} Registros: {total_registros}")
+        print(f"{LOG_PREFIX} Subject: {subject}")
+        print(f"{LOG_PREFIX} Sender: {sender}")
+        sys.stdout.flush()
+
+        # --- Enviar correo ---
+        success, result = emailSend.send_email(
+            credentials=gmail_creds,
+            sender=sender,
+            to=destinatario,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            cc=data.get('cc'),
+            bcc=data.get('bcc')
+        )
+
+        if success:
+            print(f"{LOG_PREFIX} Email sent successfully to: {destinatario}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': True,
+                'message': f"Email sent successfully to {destinatario}",
+                'data': {
+                    **result,
+                    'nota_credito': {
+                        'proveedor': proveedor,
+                        'destinatario': destinatario,
+                        'total_registros': total_registros
+                    }
+                }
+            }), 200
+        else:
+            print(f"{LOG_PREFIX} Failed to send email: {result.get('error')}")
+            print("=" * 50)
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': result.get('error', 'Unknown error'),
+                'data': result
+            }), 400
+
+    except Exception as e:
+        print(f"{LOG_PREFIX} Error: {str(e)}")
+        print("=" * 50)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/send-email/masivo-tienda', methods=['POST'])
+def send_email_masivo_tienda_endpoint():
+    """
+    Endpoint para enviar correos masivos por tienda con informe de retenidas.
+    Busca el correo de cada tienda en Google Sheets, genera un Excel adjunto
+    con los datos y envia un resumen de retenidas agrupado por proveedor.
+
+    Request Body (JSON):
+    [
+        {
+            "tienda": "Tienda A",
+            "data": [
+                {
+                    "Fecha_Recepcion": "...", "Tienda": "...", "Proveedor": "...",
+                    "Numero_Factura": "...", "SubTotal": 1500.00, ...
+                }
+            ]
+        }
+    ]
+
+    Query params opcionales:
+        - cc: correos en copia (separados por coma)
+        - bcc: correos en copia oculta (separados por coma)
+        - sender: correo del remitente
+        - subject: asunto personalizado (se usa {tienda} como placeholder)
+
+    Returns:
+        JSON con el resultado por tienda
+    """
+    LOG_PREFIX = "[SEND-EMAIL-MASIVO-TIENDA]"
+    print("=" * 50)
+    print(f"{LOG_PREFIX} Endpoint called")
+    print(f"{LOG_PREFIX} Method: {request.method}")
+    print(f"{LOG_PREFIX} Content-Type: {request.content_type}")
+    sys.stdout.flush()
+
+    try:
+        if not request.is_json:
+            print(f"{LOG_PREFIX} Error: Request must be JSON")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Request must be JSON',
+                'message': 'Please send a JSON body with Content-Type: application/json'
+            }), 400
+
+        raw_data = request.get_json()
+
+        # Soportar tanto array directo como objeto wrapper con opciones
+        if isinstance(raw_data, dict):
+            tiendas_list = raw_data.get('tiendas', [])
+            opts = raw_data
+        elif isinstance(raw_data, list):
+            tiendas_list = raw_data
+            opts = {}
+        else:
+            print(f"{LOG_PREFIX} Error: Body must be a JSON array or object")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Body must be a JSON array of tiendas or an object with "tiendas" key',
+                'message': 'Provide [{tienda, data}, ...] or {tiendas: [...], cc, bcc, sender, subject}'
+            }), 400
+
+        if not tiendas_list or not isinstance(tiendas_list, list):
+            print(f"{LOG_PREFIX} Error: tiendas list is empty or invalid")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'tiendas list is empty or invalid',
+                'message': 'Provide at least one tienda entry with {tienda, data}'
+            }), 400
+
+        # Validar estructura de cada tienda
+        for idx, entry in enumerate(tiendas_list):
+            if not isinstance(entry, dict):
+                return jsonify({
+                    'success': False,
+                    'error': f'Entry at index {idx} is not an object'
+                }), 400
+            if not entry.get('tienda'):
+                return jsonify({
+                    'success': False,
+                    'error': f'Entry at index {idx} is missing "tienda"'
+                }), 400
+            if not entry.get('data') or not isinstance(entry.get('data'), list) or len(entry['data']) == 0:
+                return jsonify({
+                    'success': False,
+                    'error': f'Entry at index {idx} ("{entry.get("tienda", "")}") has empty or invalid "data"'
+                }), 400
+
+        print(f"{LOG_PREFIX} Received {len(tiendas_list)} tiendas to process")
+        sys.stdout.flush()
+
+        # --- Obtener credenciales ---
+        gmail_creds, gmail_error = emailSend.get_gmail_credentials_oauth2()
+        if gmail_error or not gmail_creds:
+            print(f"{LOG_PREFIX} Error: Gmail not authorized - {gmail_error}")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'Gmail not authorized',
+                'message': gmail_error or 'Please authorize Gmail first via GET /auth/gmail',
+                'auth_required': True,
+                'auth_endpoint': '/auth/gmail'
+            }), 401
+
+        sheets_credentials, project_id = get_credentials()
+
+        sender = opts.get('sender', request.args.get('sender', os.getenv('EMAIL_SENDER', '')))
+        if not sender:
+            auth_status = emailSend.check_gmail_auth_status()
+            sender = auth_status.get('email', '')
+
+        cc_param = opts.get('cc', request.args.get('cc'))
+        bcc_param = opts.get('bcc', request.args.get('bcc'))
+        subject_template = opts.get('subject', request.args.get('subject'))
+
+        if isinstance(cc_param, str):
+            cc_param = [c.strip() for c in cc_param.split(',') if c.strip()]
+        if isinstance(bcc_param, str):
+            bcc_param = [c.strip() for c in bcc_param.split(',') if c.strip()]
+
+        spreadsheet_id = EMAIL_SPREADSHEET_ID
+        worksheet_name = EMAIL_WORKSHEET_NAME
+
+        if not spreadsheet_id:
+            print(f"{LOG_PREFIX} Error: No EMAIL_SPREADSHEET_ID configured")
+            sys.stdout.flush()
+            return jsonify({
+                'success': False,
+                'error': 'No spreadsheet_id configured',
+                'message': 'Please set EMAIL_SPREADSHEET_ID in .env'
+            }), 400
+
+        # --- Cargar logo Farmatodo ---
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'foto_correo', 'Farmatodo Logo cuadrado.png')
+        inline_images = []
+        logo_cid = "logo_farmatodo"
+        try:
+            with open(logo_path, 'rb') as f:
+                logo_data = f.read()
+            inline_images.append({
+                'filename': 'Farmatodo Logo cuadrado.png',
+                'content': logo_data,
+                'content_id': logo_cid,
+                'subtype': 'png'
+            })
+            print(f"{LOG_PREFIX} Logo loaded ({len(logo_data)} bytes)")
+        except FileNotFoundError:
+            print(f"{LOG_PREFIX} Warning: Logo not found at {logo_path}, sending without logo")
+        sys.stdout.flush()
+
+        # Mapeo de columnas id -> label legible
+        column_labels = {
+            'Fecha_Recepcion': 'Fecha Recepción',
+            'Tienda': 'Tienda',
+            'Proveedor': 'Proveedor',
+            'Numero_Factura': 'Número Factura',
+            'Estado': 'Estado',
+            'Orden_Compra': 'Orden Compra',
+            'Fecha_Factura': 'Fecha Factura',
+            'SubTotal': 'SubTotal',
+            'Costo_Recepcion': 'Costo Recepción',
+            'Unidades_Recibidas': 'Unidades Recibidas',
+            'Fecha_Publicacion': 'Fecha Publicación',
+            'Tipo_de_Proveedor': 'Tipo de Proveedor',
+            'Motivo_de_Retencion': 'Motivo de Retención',
+            'Validacion_de_OC': 'Validación de OC',
+            'Diferencia_Real': 'Diferencia Real',
+            'Valor_Real_de_Unidades': 'Valor Real de Unidades',
+            'Diferencia_Unidades': 'Diferencia Unidades',
+            'Valor_Real_de_Subtotal': 'Valor Real de Subtotal',
+            'Diferencia_Costo': 'Diferencia Costo',
+            'Area': 'Área',
+            'Gerente_de_Area': 'Gerente de Área',
+            'Especialista_Comercial': 'Especialista Comercial',
+            'execution_id': 'Execution ID',
+            'verification_date': 'Verification Date',
+            'status': 'Status',
+            'supplier': 'Supplier',
+            'qty_variance': 'Qty Variance',
+            'receipt_avail_qty': 'Receipt Avail Qty',
+            'invoice_qty': 'Invoice Qty',
+            'item_description': 'Item Description',
+            'invoice': 'Invoice',
+            'order_id': 'Order ID',
+        }
+
+        import pandas as pd
+        from datetime import datetime
+
+        fecha_hoy = datetime.now().strftime('%Y%m%d')
+        resultados = []
+        enviados = 0
+        fallidos = 0
+
+        # --- Procesar cada tienda ---
+        for t_idx, tienda_entry in enumerate(tiendas_list):
+            tienda = tienda_entry['tienda'].strip()
+            data_rows = tienda_entry['data']
+            print(f"{LOG_PREFIX} [{t_idx+1}/{len(tiendas_list)}] Processing: {tienda} ({len(data_rows)} records)")
+            sys.stdout.flush()
+
+            try:
+                # 1) Lookup email
+                email_tienda, _ = emailSend.search_email_in_sheet(
+                    credentials=sheets_credentials,
+                    spreadsheet_id=spreadsheet_id,
+                    worksheet_name=worksheet_name,
+                    search_column='Tienda',
+                    search_value=tienda,
+                    email_column='Correo Electrónico'
+                )
+
+                if not email_tienda:
+                    print(f"{LOG_PREFIX}   Email not found for tienda: {tienda}")
+                    sys.stdout.flush()
+                    fallidos += 1
+                    resultados.append({
+                        'tienda': tienda,
+                        'success': False,
+                        'error': f"No email found for Tienda='{tienda}' in Google Sheet"
+                    })
+                    continue
+
+                print(f"{LOG_PREFIX}   Email found: {email_tienda}")
+                sys.stdout.flush()
+
+                # 2) Generar Excel
+                df = pd.DataFrame(data_rows)
+                rename_map = {col: column_labels.get(col, col) for col in df.columns if col in column_labels}
+                df_excel = df.rename(columns=rename_map)
+
+                excel_output = io.BytesIO()
+                df_excel.to_excel(excel_output, index=False, engine='openpyxl')
+                excel_output.seek(0)
+                excel_bytes = excel_output.getvalue()
+
+                safe_tienda = tienda.replace(' ', '_').replace('/', '-')
+                excel_filename = f"Retenidas_{safe_tienda}_{fecha_hoy}.xlsx"
+
+                print(f"{LOG_PREFIX}   Excel generated: {excel_filename} ({len(excel_bytes)} bytes)")
+                sys.stdout.flush()
+
+                # 3) Generar resumen por proveedor
+                df_summary = df.copy()
+                df_summary['SubTotal'] = pd.to_numeric(df_summary.get('SubTotal', 0), errors='coerce').fillna(0)
+                resumen = df_summary.groupby('Proveedor', dropna=False).agg(
+                    Cant_Facturas=('Proveedor', 'size'),
+                    Monto_Retenido=('SubTotal', 'sum')
+                ).reset_index()
+                resumen = resumen.sort_values('Monto_Retenido', ascending=False)
+
+                total_facturas = int(resumen['Cant_Facturas'].sum())
+                total_monto = resumen['Monto_Retenido'].sum()
+                total_proveedores = len(resumen)
+
+                # Construir filas HTML del resumen
+                rows_html = ""
+                rows_text = ""
+                for i, (_, row) in enumerate(resumen.iterrows(), start=1):
+                    bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+                    prov_name = row['Proveedor'] if pd.notna(row['Proveedor']) and str(row['Proveedor']).strip() else '(Sin Proveedor)'
+                    rows_html += f"""
+                        <tr style="background-color: {bg};">
+                            <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;">{i}</td>
+                            <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{prov_name}</td>
+                            <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;">{int(row['Cant_Facturas'])}</td>
+                            <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: right;">{row['Monto_Retenido']:,.2f}</td>
+                        </tr>"""
+                    rows_text += f"  {i}. {prov_name} | Facturas: {int(row['Cant_Facturas'])} | Monto: {row['Monto_Retenido']:,.2f}\n"
+
+                # 4) Construir HTML
+                subject = subject_template.replace('{tienda}', tienda) if subject_template else f"Informe de Retenidas - {tienda}"
+
+                body_html = f"""
+<html>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f4; padding: 20px 0;">
+        <tr>
+            <td align="center">
+                <table width="640" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                    <!-- Header -->
+                    <tr>
+                        <td style="background-color: #002858; padding: 24px 32px;">
+                            <table cellpadding="0" cellspacing="0" style="width: 100%;">
+                                <tr>
+                                    <td style="width: 65px; vertical-align: middle;">
+                                        <img src="cid:{logo_cid}" alt="Farmatodo" width="60" height="60" style="display: block; border-radius: 6px;" />
+                                    </td>
+                                    <td style="vertical-align: middle; padding-left: 14px;">
+                                        <h1 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 600;">Informe de Retenidas</h1>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    <!-- Body -->
+                    <tr>
+                        <td style="padding: 32px;">
+                            <p style="margin: 0 0 16px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Estimado(a),
+                            </p>
+                            <p style="margin: 0 0 24px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Le informamos el resumen de facturas retenidas correspondientes a la tienda
+                                <strong>{tienda}</strong>. Se adjunta archivo Excel con el detalle completo.
+                            </p>
+
+                            <!-- Info summary -->
+                            <table style="border-collapse: collapse; margin-bottom: 24px; width: 100%;">
+                                <tr>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; background-color: #f5f5f5; width: 180px;"><strong>Tienda</strong></td>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{tienda}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; background-color: #f5f5f5;"><strong>Total de Registros</strong></td>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{total_facturas}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; background-color: #f5f5f5;"><strong>Total de Proveedores</strong></td>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{total_proveedores}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0; background-color: #f5f5f5;"><strong>Monto Total Retenido</strong></td>
+                                    <td style="padding: 10px 14px; border: 1px solid #e0e0e0;"><strong>{total_monto:,.2f}</strong></td>
+                                </tr>
+                            </table>
+
+                            <!-- Resumen por proveedor -->
+                            <p style="margin: 0 0 12px 0; color: #333333; font-size: 15px; font-weight: 600;">
+                                Resumen por Proveedor:
+                            </p>
+                            <table style="border-collapse: collapse; width: 100%; margin-bottom: 24px;">
+                                <thead>
+                                    <tr style="background-color: #002858;">
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: center; font-size: 13px;">#</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: left; font-size: 13px;">Proveedor</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: center; font-size: 13px;">Cant. Facturas</th>
+                                        <th style="padding: 12px 14px; border: 1px solid #001f45; color: #ffffff; text-align: right; font-size: 13px;">Monto Retenido</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {rows_html}
+                                    <tr style="background-color: #e8edf2; font-weight: bold;">
+                                        <td style="padding: 10px 14px; border: 1px solid #e0e0e0;" colspan="2"><strong>Total</strong></td>
+                                        <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: center;"><strong>{total_facturas}</strong></td>
+                                        <td style="padding: 10px 14px; border: 1px solid #e0e0e0; text-align: right;"><strong>{total_monto:,.2f}</strong></td>
+                                    </tr>
+                                </tbody>
+                            </table>
+
+                            <p style="margin: 0 0 8px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Se adjunta archivo Excel con el detalle completo de las facturas retenidas.
+                            </p>
+                            <p style="margin: 0 0 8px 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Por favor, revise la informaci&oacute;n y no dude en contactarnos si tiene alguna consulta.
+                            </p>
+                            <p style="margin: 24px 0 0 0; color: #333333; font-size: 15px; line-height: 1.6;">
+                                Saludos cordiales.
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Footer -->
+                    <tr>
+                        <td style="background-color: #f5f5f5; padding: 16px 32px; text-align: center;">
+                            <p style="margin: 0; color: #999999; font-size: 12px;">
+                                Este es un correo autom&aacute;tico. Por favor no responda directamente a este mensaje.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
+
+                body_text = f"""Informe de Retenidas - {tienda}
+
+Estimado(a),
+
+Le informamos el resumen de facturas retenidas correspondientes a la tienda {tienda}.
+Se adjunta archivo Excel con el detalle completo.
+
+Tienda: {tienda}
+Total de Registros: {total_facturas}
+Total de Proveedores: {total_proveedores}
+Monto Total Retenido: {total_monto:,.2f}
+
+Resumen por Proveedor:
+{rows_text}
+Total: {total_facturas} facturas | Monto: {total_monto:,.2f}
+
+Se adjunta archivo Excel con el detalle completo de las facturas retenidas.
+Por favor, revise la información y no dude en contactarnos si tiene alguna consulta.
+
+Saludos cordiales.
+"""
+
+                # 5) Enviar correo
+                success, result = emailSend.send_email(
+                    credentials=gmail_creds,
+                    sender=sender,
+                    to=email_tienda,
+                    subject=subject,
+                    body_text=body_text,
+                    body_html=body_html,
+                    cc=cc_param,
+                    bcc=bcc_param,
+                    attachments=[{
+                        'filename': excel_filename,
+                        'content': excel_bytes,
+                        'mime_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    }],
+                    inline_images=inline_images if inline_images else None
+                )
+
+                if success:
+                    print(f"{LOG_PREFIX}   Email sent successfully to: {email_tienda}")
+                    sys.stdout.flush()
+                    enviados += 1
+                    resultados.append({
+                        'tienda': tienda,
+                        'success': True,
+                        'email': email_tienda,
+                        'registros': len(data_rows),
+                        'proveedores': total_proveedores,
+                        'monto_total': total_monto,
+                        'message_id': result.get('message_id')
+                    })
+                else:
+                    print(f"{LOG_PREFIX}   Failed to send email: {result.get('error')}")
+                    sys.stdout.flush()
+                    fallidos += 1
+                    resultados.append({
+                        'tienda': tienda,
+                        'success': False,
+                        'email': email_tienda,
+                        'error': result.get('error', 'Unknown error')
+                    })
+
+            except Exception as tienda_error:
+                print(f"{LOG_PREFIX}   Error processing tienda '{tienda}': {str(tienda_error)}")
+                sys.stdout.flush()
+                import traceback
+                traceback.print_exc()
+                fallidos += 1
+                resultados.append({
+                    'tienda': tienda,
+                    'success': False,
+                    'error': str(tienda_error)
+                })
+
+        # --- Respuesta global ---
+        total_tiendas = len(tiendas_list)
+        all_success = fallidos == 0
+
+        print(f"{LOG_PREFIX} Completed: {enviados}/{total_tiendas} sent, {fallidos} failed")
+        print("=" * 50)
+        sys.stdout.flush()
+
+        status_code = 200 if all_success else (207 if enviados > 0 else 400)
+        return jsonify({
+            'success': all_success,
+            'total_tiendas': total_tiendas,
+            'enviados': enviados,
+            'fallidos': fallidos,
+            'resultados': resultados
+        }), status_code
+
+    except Exception as e:
+        print(f"{LOG_PREFIX} Error: {str(e)}")
         print("=" * 50)
         sys.stdout.flush()
         import traceback
